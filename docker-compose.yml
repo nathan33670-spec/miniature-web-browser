@@ -16,7 +16,8 @@ services:
       UPSTREAM_USERNAME: ${INTERNAL_BROWSER_USER:-abc}
       UPSTREAM_PASSWORD: ${INTERNAL_BROWSER_PASSWORD:-}
     ports:
-      - "${GATEWAY_PORT:-8443}:8443"
+      # Publié en IPv4 uniquement : aucune écoute IPv6 sur le NAS.
+      - "0.0.0.0:${GATEWAY_PORT:-8443}:8443"
     volumes:
       - ./data/gateway:/data
     depends_on:
@@ -44,8 +45,8 @@ services:
       LC_ALL: ${BROWSER_LOCALE:-fr_FR.UTF-8}
       TITLE: Navigateur distant
       CHROME_CLI: ${CHROME_CLI:-https://www.google.fr}
-      # Mettre "true" si le noyau du NAS n'a pas d'IPv6 (erreur nginx "[::]:3000 failed").
-      DISABLE_IPV6: ${DISABLE_IPV6:-}
+      # IPv6 désactivé aussi côté navigateur (écoute interne en IPv4 seulement).
+      DISABLE_IPV6: "true"
       # Mot de passe interne (défense en profondeur) : la passerelle l'injecte
       # automatiquement, vous n'avez jamais à le saisir.
       CUSTOM_USER: ${INTERNAL_BROWSER_USER:-abc}
@@ -61,3 +62,4 @@ services:
 networks:
   browser:
     driver: bridge
+    enable_ipv6: false

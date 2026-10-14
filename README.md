@@ -26,6 +26,7 @@ profitez de sa connexion Internet sans les restrictions du réseau où vous vous
 | Double authentification | **TOTP** optionnel (Google Authenticator, Aegis, Bitwarden…), codes à usage unique. |
 | Anti-bruteforce | 5 échecs en 15 min ⇒ IP bloquée 30 min (réglable), délai à chaque échec. |
 | Sessions | Cookie aléatoire `HttpOnly`, `SameSite=Strict`, `Secure` en HTTPS. Expiration après 12 h et après 2 h d'inactivité. La déconnexion coupe aussi le flux vidéo. |
+| IPv4 uniquement | Port publié seulement en IPv4, toute connexion IPv6 refusée (même relayée par un reverse proxy). |
 | Restriction IP | Optionnelle, voir plus bas. Appliquée aussi aux WebSockets. |
 | HTTPS | Certificat auto-signé généré au premier démarrage, ou vos propres certificats. |
 | Défense en profondeur | Chromium protégé par un mot de passe interne que la passerelle injecte automatiquement ; conteneur passerelle en lecture seule, non-root. |
@@ -87,7 +88,7 @@ la page de connexion. L'authentification reste **toujours** obligatoire, même p
 
 ```ini
 IP_RESTRICTION_ENABLED=true
-IP_ALLOWLIST=81.250.12.34, 92.184.0.0/16, 2a01:cb00::/32
+IP_ALLOWLIST=81.250.12.34, 92.184.0.0/16
 ```
 
 Sont **toujours autorisés**, quelle que soit la liste :
@@ -100,11 +101,20 @@ Sont **toujours autorisés**, quelle que soit la liste :
 
 Les refus sont journalisés : `docker compose logs gateway | grep refusé`.
 
-> **Remarque** : selon la configuration Docker du NAS, certaines connexions externes (notamment en
-> IPv6 lorsque le conteneur n'a pas d'IPv6) peuvent être relayées par Docker et apparaître avec
-> l'IP de la passerelle Docker, donc être considérées « locales ». Si vous voulez un filtrage IP
-> strict, mettez `TRUST_DOCKER_GATEWAY=false` et listez explicitement les IP du NAS dans `NAS_IPS`.
-> Le mot de passe et le 2FA restent de toute façon exigés.
+## IPv4 uniquement
+
+L'accès entrant est limité à l'IPv4 (`IPV4_ONLY=true`, par défaut) :
+
+- le port est publié sur `0.0.0.0` seulement : Docker n'ouvre **aucune écoute IPv6** sur le NAS ;
+- la passerelle coupe toute connexion IPv6 directe, et refuse (403) un client IPv6 relayé par
+  un reverse proxy via `X-Forwarded-For` ;
+- l'IP publique du serveur est détectée/résolue en IPv4 uniquement ;
+- le réseau Docker interne et Chromium n'écoutent qu'en IPv4 ;
+- une adresse IPv6 dans `IP_ALLOWLIST`, `NAS_IPS` ou `SERVER_PUBLIC_IP` est signalée comme
+  erreur au démarrage.
+
+Comme Docker ne relaie plus d'IPv6, aucune connexion externe ne peut se faire passer pour le NAS
+via la passerelle Docker.
 
 ## Derrière un reverse proxy (Synology, Nginx Proxy Manager, Traefik…)
 
@@ -136,8 +146,6 @@ TLS_KEY_FILE=/data/tls/privkey.pem
   Chromium).
 - **Profil persistant** (favoris, historique, extensions, sessions) : `./data/chromium`.
 - **Langue / fuseau** : `BROWSER_LOCALE`, `TZ`.
-- Si les logs Chromium affichent `socket() [::]:3000 failed (97: Address family not supported)`,
-  le noyau du NAS n'a pas d'IPv6 : mettez `DISABLE_IPV6=true`.
 
 ## Mise à jour
 

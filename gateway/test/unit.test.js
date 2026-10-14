@@ -151,4 +151,8 @@ test('loadConfig exige un mot de passe et valide les options', () => {
   const c = loadConfig({ AUTH_PASSWORD: 'x', IP_RESTRICTION_ENABLED: 'true', IP_ALLOWLIST: '1.2.3.4, 10.0.0.0/8' });
   assert.equal(c.access.enabled, true);
   assert.deepEqual(c.access.allowlist, ['1.2.3.4', '10.0.0.0/8']);
+  assert.equal(c.access.ipv4Only, true, 'IPv4 uniquement par défaut');
+  assert.throws(() => loadConfig({ AUTH_PASSWORD: 'x', IP_ALLOWLIST: '2a01:cb00::/32' }), /IPv6/);
+  assert.throws(() => loadConfig({ AUTH_PASSWORD: 'x', LISTEN_HOST: '::' }), /IPv6/);
+  assert.doesNotThrow(() => loadConfig({ AUTH_PASSWORD: 'x', IPV4_ONLY: 'false', IP_ALLOWLIST: '2a01:cb00::/32' }));
 });

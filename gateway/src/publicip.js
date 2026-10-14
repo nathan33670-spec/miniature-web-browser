@@ -1,6 +1,7 @@
 'use strict';
 
 const dns = require('node:dns').promises;
+const net = require('node:net');
 const { normalizeIp } = require('./ipfilter');
 
 async function fetchIp(url, timeoutMs = 5000) {
@@ -11,8 +12,8 @@ async function fetchIp(url, timeoutMs = 5000) {
   return ip;
 }
 
-async function resolveHostname(hostname) {
-  const records = await dns.lookup(hostname, { all: true, verbatim: true });
+async function resolveHostname(hostname, family = 0) {
+  const records = await dns.lookup(hostname, { all: true, verbatim: true, family });
   return records.map((r) => normalizeIp(r.address)).filter(Boolean);
 }
 
@@ -22,7 +23,8 @@ async function resolveHostname(hostname) {
  * derrière la même box sortent avec cette IP : ils sont donc toujours autorisés.
  */
 class PublicIpTracker {
-  constructor({ staticIps = [], hostnames = [], autodetect = true, urls = [], refreshMs = 600_000, logger, onChange }) {
+  constructor({ staticIps = [], hostnames = [], autodetect = true, urls = [], refreshMs = 600_000, ipv4Only = false, logger, onChange }) {
+    this.ipv4Only = ipv4Only;
     this.staticIps = staticIps.map(normalizeIp).filter(Boolean);
     this.hostnames = hostnames;
     this.autodetect = autodetect;
@@ -40,7 +42,7 @@ class PublicIpTracker {
 
     for (const hostname of this.hostnames) {
       try {
-        for (const ip of await resolveHostname(hostname)) ips.add(ip);
+        for (const ip of await resolveHostname(hostname, this.ipv4Only ? 4 : 0)) ips.add(ip);
       } catch (err) {
         this.logger.warn(`Résolution DNS de ${hostname} impossible : ${err.message}`);
       }
@@ -50,7 +52,9 @@ class PublicIpTracker {
       let detected = null;
       for (const url of this.urls) {
         try {
-          detected = await fetchIp(url);
+          const ip = await fetchIp(url);
+          if (this.ipv4Only && !net.isIPv4(ip)) throw new Error(`adresse IPv6 ignorée (${ip})`);
+          detected = ip;
           break;
         } catch (err) {
           this.logger.debug(`Détection IP publique via ${url} échouée : ${err.message}`);

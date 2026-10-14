@@ -1,10 +1,11 @@
 'use strict';
 
 const fs = require('node:fs');
+const net = require('node:net');
 const http = require('node:http');
 const https = require('node:https');
 
-const { AccessControl, IpSet, resolveClientIp, detectDockerGateways } = require('./ipfilter');
+const { AccessControl, IpSet, resolveClientIp, detectDockerGateways, normalizeIp } = require('./ipfilter');
 const { verifyPassword, hashPassword, safeEqual, TotpVerifier, SessionStore, LoginLimiter } = require('./auth');
 const { PublicIpTracker } = require('./publicip');
 const { Proxy } = require('./proxy');
@@ -90,6 +91,7 @@ async function createGateway(config, { logger = createLogger(config.logLevel), d
       autodetect: config.access.publicIpAutodetect,
       urls: config.access.publicIpUrls,
       refreshMs: config.access.publicIpRefreshMs,
+      ipv4Only: config.access.ipv4Only,
       logger,
       onChange: (ips) => access.setDynamic(ips),
     });
@@ -212,8 +214,17 @@ async function createGateway(config, { logger = createLogger(config.logLevel), d
     }
   }
 
+  /** IPV4_ONLY : toute adresse cliente IPv6 (directe ou relayée) est refusée. */
+  function familyAllowed(ip) {
+    return !config.access.ipv4Only || net.isIPv4(ip);
+  }
+
   async function onRequest(req, res) {
     const ctx = context(req);
+    if (!familyAllowed(ctx.clientIp)) {
+      logger.warn(`Accès refusé pour ${ctx.clientIp} (IPv6 désactivé) : ${req.method} ${req.url}`);
+      return send(res, 403, messagePage('Accès refusé', 'Seules les connexions IPv4 sont acceptées.'));
+    }
     const reason = access.check(ctx.clientIp);
     if (!reason) {
       logger.warn(`Accès refusé pour ${ctx.clientIp} (hors liste blanche) : ${req.method} ${req.url}`);
@@ -256,6 +267,10 @@ async function createGateway(config, { logger = createLogger(config.logLevel), d
       socket.destroy();
     };
     const ctx = context(req);
+    if (!familyAllowed(ctx.clientIp)) {
+      logger.warn(`WebSocket refusé pour ${ctx.clientIp} (IPv6 désactivé)`);
+      return reject(403, 'Forbidden');
+    }
     if (!access.check(ctx.clientIp)) {
       logger.warn(`WebSocket refusé pour ${ctx.clientIp} (hors liste blanche)`);
       return reject(403, 'Forbidden');
@@ -276,6 +291,10 @@ async function createGateway(config, { logger = createLogger(config.logLevel), d
     ? https.createServer({ cert: fs.readFileSync(config.tls.certFile), key: fs.readFileSync(config.tls.keyFile) }, handler)
     : http.createServer(handler);
   server.on('upgrade', onUpgrade);
+  // Coupe immédiatement les connexions IPv6 directes, avant même la négociation TLS.
+  server.on('connection', (socket) => {
+    if (config.access.ipv4Only && !net.isIPv4(normalizeIp(socket.remoteAddress))) socket.destroy();
+  });
   server.on('clientError', (err, socket) => socket.destroy());
   // Pas de limite globale sur la durée d'une requête (téléchargements longs) ;
   // les en-têtes doivent cependant arriver rapidement.

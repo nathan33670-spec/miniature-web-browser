@@ -3,7 +3,7 @@
 const DEFAULT_PUBLIC_IP_URLS = [
   'https://api.ipify.org',
   'https://ipv4.icanhazip.com',
-  'https://ifconfig.me/ip',
+  'https://v4.ident.me',
 ];
 
 function list(value) {
@@ -55,6 +55,7 @@ function loadConfig(env = process.env) {
       failureDelayMs: num(env.LOGIN_FAILURE_DELAY_MS, 1000),
     },
     access: {
+      ipv4Only: bool(env.IPV4_ONLY, true),
       enabled: bool(env.IP_RESTRICTION_ENABLED, false),
       allowlist: list(env.IP_ALLOWLIST),
       nasIps: list(env.NAS_IPS),
@@ -98,6 +99,20 @@ function validate(config) {
   }
   if (!['auto', 'true', 'false'].includes(config.session.cookieSecure)) {
     throw new Error('COOKIE_SECURE doit valoir "auto", "true" ou "false".');
+  }
+  if (config.access.ipv4Only) {
+    const net = require('node:net');
+    if (net.isIPv6(config.listen.host)) {
+      throw new Error(`LISTEN_HOST=${config.listen.host} est une adresse IPv6 alors que IPV4_ONLY=true.`);
+    }
+    for (const [name, entries] of [
+      ['IP_ALLOWLIST', config.access.allowlist],
+      ['NAS_IPS', config.access.nasIps],
+      ['SERVER_PUBLIC_IP', config.access.publicIps],
+    ]) {
+      const v6 = entries.filter((e) => e.includes(':'));
+      if (v6.length) throw new Error(`${name} contient des adresses IPv6 (${v6.join(', ')}) alors que IPV4_ONLY=true.`);
+    }
   }
   try {
     new URL(config.upstream.url);

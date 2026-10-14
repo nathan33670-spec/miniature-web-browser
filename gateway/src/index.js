@@ -18,6 +18,7 @@ async function main() {
   logger.info(`Passerelle à l'écoute sur ${config.tls.mode === 'off' ? 'http' : 'https'}://${address.address}:${address.port}`);
   logger.info(`Navigateur (amont) : ${config.upstream.url}`);
   logger.info(`Double authentification (TOTP) : ${config.auth.totpSecret ? 'activée' : 'désactivée'}`);
+  logger.info(`Connexions entrantes : ${config.access.ipv4Only ? 'IPv4 uniquement' : 'IPv4 et IPv6'}`);
   if (config.access.enabled) {
     logger.info('Restriction IP : ACTIVÉE');
     logger.info(`  Toujours autorisés : localhost, NAS (${[...config.access.nasIps, ...gateway.gateways].join(', ') || 'aucune IP déclarée'})` +

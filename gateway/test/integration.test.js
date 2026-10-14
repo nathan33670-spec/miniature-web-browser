@@ -242,6 +242,32 @@ test('X-Forwarded-For ignoré si la connexion ne vient pas d\'un proxy de confia
   }
 });
 
+test('IPV4_ONLY : client IPv6 relayé par un proxy refusé, y compris en WebSocket', async () => {
+  const ctx = await setup({ TRUSTED_PROXIES: '127.0.0.1' });
+  try {
+    const v6 = await request(ctx.port, { path: '/__auth/login', headers: { 'x-forwarded-for': '2001:db8::1' } });
+    assert.equal(v6.status, 403);
+    assert.match(v6.body, /IPv4/);
+    const v4 = await request(ctx.port, { path: '/__auth/login', headers: { 'x-forwarded-for': '198.51.100.1' } });
+    assert.equal(v4.status, 200);
+    const ws = await wsHandshake(ctx.port, { 'X-Forwarded-For': '2001:db8::1' });
+    assert.equal(ws.status, 403);
+    ws.socket.destroy();
+  } finally {
+    await ctx.close();
+  }
+});
+
+test('IPV4_ONLY=false : un client IPv6 est accepté', async () => {
+  const ctx = await setup({ TRUSTED_PROXIES: '127.0.0.1', IPV4_ONLY: 'false' });
+  try {
+    const v6 = await request(ctx.port, { path: '/__auth/login', headers: { 'x-forwarded-for': '2001:db8::1' } });
+    assert.equal(v6.status, 200);
+  } finally {
+    await ctx.close();
+  }
+});
+
 test('502 lisible quand le navigateur est arrêté', async () => {
   const ctx = await setup();
   try {
