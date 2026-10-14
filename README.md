@@ -37,6 +37,7 @@ profitez de sa connexion Internet sans les restrictions du réseau où vous vous
 git clone https://github.com/nathan33670-spec/miniature-web-browser.git
 cd miniature-web-browser
 cp .env.example .env
+mkdir -p data/gateway data/chromium   # certains NAS (Synology) ne les créent pas seuls
 docker compose build
 ```
 
