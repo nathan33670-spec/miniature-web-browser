@@ -1,0 +1,63 @@
+name: remote-browser
+
+services:
+  # ---------------------------------------------------------------------------
+  # Passerelle : seul point d'entrée exposé. Gère HTTPS, l'authentification,
+  # la restriction par IP et relaie le flux (HTTP + WebSocket) vers Chromium.
+  # ---------------------------------------------------------------------------
+  gateway:
+    build: ./gateway
+    image: remote-browser-gateway:latest
+    container_name: remote-browser-gateway
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      UPSTREAM_URL: http://chromium:3000
+      UPSTREAM_USERNAME: ${INTERNAL_BROWSER_USER:-abc}
+      UPSTREAM_PASSWORD: ${INTERNAL_BROWSER_PASSWORD:-}
+    ports:
+      - "${GATEWAY_PORT:-8443}:8443"
+    volumes:
+      - ./data/gateway:/data
+    depends_on:
+      - chromium
+    networks:
+      - browser
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+  # ---------------------------------------------------------------------------
+  # Navigateur : Chromium affiché dans le navigateur web (image linuxserver.io).
+  # AUCUN port publié : il n'est joignable qu'à travers la passerelle.
+  # ---------------------------------------------------------------------------
+  chromium:
+    image: ${CHROMIUM_IMAGE:-lscr.io/linuxserver/chromium:latest}
+    container_name: remote-browser-chromium
+    restart: unless-stopped
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-Europe/Paris}
+      LC_ALL: ${BROWSER_LOCALE:-fr_FR.UTF-8}
+      TITLE: Navigateur distant
+      CHROME_CLI: ${CHROME_CLI:-https://www.google.fr}
+      # Mettre "true" si le noyau du NAS n'a pas d'IPv6 (erreur nginx "[::]:3000 failed").
+      DISABLE_IPV6: ${DISABLE_IPV6:-}
+      # Mot de passe interne (défense en profondeur) : la passerelle l'injecte
+      # automatiquement, vous n'avez jamais à le saisir.
+      CUSTOM_USER: ${INTERNAL_BROWSER_USER:-abc}
+      PASSWORD: ${INTERNAL_BROWSER_PASSWORD:-}
+    volumes:
+      - ./data/chromium:/config
+    shm_size: "1gb"
+    security_opt:
+      - seccomp:unconfined
+    networks:
+      - browser
+
+networks:
+  browser:
+    driver: bridge
