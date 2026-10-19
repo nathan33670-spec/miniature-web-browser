@@ -16,7 +16,7 @@ async function main() {
   const address = await gateway.listen();
 
   logger.info(`Passerelle à l'écoute sur ${config.tls.mode === 'off' ? 'http' : 'https'}://${address.address}:${address.port}`);
-  logger.info(`Navigateur (amont) : ${config.upstream.url}`);
+  logger.info(`Bureau distant : ${config.desktop.host}:${config.desktop.port} via guacd ${config.guacd.host}:${config.guacd.port} (tunnel HTTP, sans WebSocket)`);
   logger.info(`Double authentification (TOTP) : ${config.auth.totpSecret ? 'activée' : 'désactivée'}`);
   logger.info(`Connexions entrantes : ${config.access.ipv4Only ? 'IPv4 uniquement' : 'IPv4 et IPv6'}`);
   if (config.access.enabled) {

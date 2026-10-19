@@ -19,7 +19,7 @@ const {
 } = require('../src/auth');
 const { loadConfig } = require('../src/config');
 const { safeNext } = require('../src/server');
-const { removeCookie } = require('../src/proxy');
+const { InstructionParser, encodeInstruction, codepointLength } = require('../src/guac');
 
 test('normalizeIp gère IPv4-mapped, crochets et zones', () => {
   assert.equal(normalizeIp('::ffff:192.168.1.10'), '192.168.1.10');
@@ -140,9 +140,23 @@ test('safeNext empêche les redirections ouvertes', () => {
   assert.equal(safeNext('/__auth/logout'), '/');
 });
 
-test('removeCookie retire uniquement le cookie de session', () => {
-  assert.equal(removeCookie('a=1; rb_session=xyz; b=2', 'rb_session'), 'a=1; b=2');
-  assert.equal(removeCookie('rb_session=xyz', 'rb_session'), undefined);
+test('protocole Guacamole : encodage et analyse par morceaux (points de code)', () => {
+  assert.equal(encodeInstruction('select', 'vnc'), '6.select,3.vnc;');
+  assert.equal(encodeInstruction('key', 'é😀'), '3.key,2.é😀;');
+  assert.equal(codepointLength('a😀b'), 3);
+
+  const parser = new InstructionParser();
+  const stream = '4.sync,3.123;' + encodeInstruction('name', 'Café 😀') + '0.;';
+  const out = [];
+  // Découpage arbitraire, y compris au milieu d'une paire de substitution.
+  for (let i = 0; i < stream.length; i += 3) out.push(...parser.push(stream.slice(i, i + 3)));
+  assert.deepEqual(out.map((x) => x.opcode), ['sync', 'name', '']);
+  assert.deepEqual(out[1].args, ['Café 😀']);
+  assert.equal(out.map((x) => x.raw).join(''), stream);
+  assert.equal(parser.buffer, '');
+
+  assert.throws(() => new InstructionParser().push('x.abc;'), /invalide/);
+  assert.throws(() => new InstructionParser().push('3.abcd;'), /invalide/);
 });
 
 test('loadConfig exige un mot de passe et valide les options', () => {

@@ -31,10 +31,14 @@ function loadConfig(env = process.env) {
       host: env.LISTEN_HOST || '0.0.0.0',
       port: num(env.LISTEN_PORT, 8443),
     },
-    upstream: {
-      url: env.UPSTREAM_URL || 'http://chromium:3000',
-      username: env.UPSTREAM_USERNAME || '',
-      password: env.UPSTREAM_PASSWORD || '',
+    guacd: {
+      host: env.GUACD_HOST || 'guacd',
+      port: num(env.GUACD_PORT, 4822),
+    },
+    desktop: {
+      host: env.DESKTOP_HOST || 'desktop',
+      port: num(env.DESKTOP_VNC_PORT, 5900),
+      password: env.DESKTOP_VNC_PASSWORD || '',
     },
     auth: {
       username: env.AUTH_USERNAME || 'admin',
@@ -113,11 +117,6 @@ function validate(config) {
       const v6 = entries.filter((e) => e.includes(':'));
       if (v6.length) throw new Error(`${name} contient des adresses IPv6 (${v6.join(', ')}) alors que IPV4_ONLY=true.`);
     }
-  }
-  try {
-    new URL(config.upstream.url);
-  } catch {
-    throw new Error(`UPSTREAM_URL invalide : "${config.upstream.url}"`);
   }
 }
 

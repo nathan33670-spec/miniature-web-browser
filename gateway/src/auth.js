@@ -181,10 +181,10 @@ class SessionStore {
     for (const socket of session.sockets) socket.destroy();
   }
 
-  /** Purge les sessions expirées et coupe leurs WebSockets encore ouverts. */
+  /** Purge les sessions expirées et ferme leurs tunnels d'affichage encore ouverts. */
   sweep(now = Date.now()) {
     for (const [key, session] of this.sessions) {
-      // Un WebSocket actif (flux vidéo du navigateur) compte comme activité.
+      // Un tunnel d'affichage ouvert compte comme activité.
       if (session.sockets.size > 0) session.lastSeen = now;
       if (this.isExpired(session, now)) this.destroyByKey(key);
     }

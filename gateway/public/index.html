@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="robots" content="noindex, nofollow">
+<title>Navigateur distant</title>
+<link rel="stylesheet" href="/static/client.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 48 48%27%3E%3Ccircle cx=%2724%27 cy=%2724%27 r=%2722%27 fill=%27%232563eb%27/%3E%3Ccircle cx=%2724%27 cy=%2724%27 r=%279%27 fill=%27%23fff%27/%3E%3C/svg%3E">
+</head>
+<body>
+<div id="display" tabindex="0" aria-label="Écran du navigateur distant"></div>
+
+<div id="overlay">
+  <div class="card">
+    <div class="spinner" id="spinner"></div>
+    <p id="status">Connexion au navigateur…</p>
+    <button type="button" id="reconnect" hidden>Reconnecter</button>
+  </div>
+</div>
+
+<div id="toolbar">
+  <button type="button" id="menu-button" title="Menu" aria-haspopup="true" aria-expanded="false">⋯</button>
+  <div id="menu" hidden>
+    <button type="button" data-action="fullscreen">Plein écran</button>
+    <button type="button" data-action="paste">Envoyer du texte…</button>
+    <button type="button" data-action="reconnect">Reconnecter</button>
+    <a href="/__auth/logout">Déconnexion</a>
+  </div>
+</div>
+
+<dialog id="paste-dialog">
+  <form method="dialog">
+    <label for="paste-text">Texte à placer dans le presse-papiers du navigateur distant</label>
+    <textarea id="paste-text" rows="6"></textarea>
+    <div class="actions">
+      <button value="cancel" type="submit">Annuler</button>
+      <button value="send" type="submit" class="primary">Envoyer</button>
+    </div>
+  </form>
+</dialog>
+
+<script type="module" src="/static/client.js"></script>
+</body>
+</html>

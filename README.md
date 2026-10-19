@@ -5,18 +5,23 @@ navigateur (PC, tablette, téléphone). Toute la navigation se fait depuis le NA
 profitez de sa connexion Internet sans les restrictions du réseau où vous vous trouvez.
 
 ```
- Vous (Internet) ──HTTPS──▶  gateway :8443  ──HTTP + WebSocket (réseau Docker interne)──▶  chromium
-                            • HTTPS                                                       • Chromium réel
-                            • Connexion + 2FA                                             • Aucun port publié
-                            • Anti-bruteforce                                             • Mot de passe interne
-                            • Restriction IP
+ Vous ──HTTPS (requêtes HTTP classiques)──▶ gateway :8443 ──▶ guacd ──VNC──▶ desktop (Chromium)
+                                            • HTTPS              (réseau Docker interne, isolé)
+                                            • Connexion + 2FA
+                                            • Restriction IP
+                                            • Page d'affichage
 ```
 
-- **`chromium`** : image [linuxserver/chromium](https://docs.linuxserver.io/images/docker-chromium/)
-  (Chromium affiché dans une page web). Elle n'est **pas exposée** : impossible de la joindre sans
-  passer par la passerelle.
-- **`gateway`** : petite passerelle Node.js (sans dépendance externe) écrite pour ce projet. C'est le
-  seul port ouvert.
+**Aucun WebSocket** : l'affichage utilise le *tunnel HTTP* d'[Apache Guacamole](https://guacamole.apache.org/).
+L'écran est transmis par une succession de courtes requêtes HTTPS ordinaires (comme du
+« long polling »), ce qui traverse les proxys d'entreprise qui bloquent les WebSockets ou
+qui mettent les réponses en tampon.
+
+- **`gateway`** : passerelle Node.js écrite pour ce projet, seul port ouvert. Elle authentifie,
+  filtre, sert la page d'affichage et implémente le tunnel HTTP Guacamole.
+- **`guacd`** : moteur officiel Guacamole, qui convertit la session VNC. Réseau interne uniquement.
+- **`desktop`** : **Chromium** (Debian) dans une session TigerVNC. Aucun port publié ; seul ce
+  conteneur a accès à Internet pour naviguer.
 
 ## Sécurité
 
@@ -25,11 +30,11 @@ profitez de sa connexion Internet sans les restrictions du réseau où vous vous
 | Authentification | Un seul compte. Mot de passe stocké uniquement sous forme de hash **scrypt**. |
 | Double authentification | **TOTP** optionnel (Google Authenticator, Aegis, Bitwarden…), codes à usage unique. |
 | Anti-bruteforce | 5 échecs en 15 min ⇒ IP bloquée 30 min (réglable), délai à chaque échec. |
-| Sessions | Cookie aléatoire `HttpOnly`, `SameSite=Strict`, `Secure` en HTTPS. Expiration après 12 h et après 2 h d'inactivité. La déconnexion coupe aussi le flux vidéo. |
+| Sessions | Cookie aléatoire `HttpOnly`, `SameSite=Strict`, `Secure` en HTTPS. Expiration après 12 h et après 2 h d'inactivité. La déconnexion coupe aussi l'affichage. |
 | IPv4 uniquement | Port publié seulement en IPv4, toute connexion IPv6 refusée (même relayée par un reverse proxy). |
-| Restriction IP | Optionnelle, voir plus bas. Appliquée aussi aux WebSockets. |
+| Restriction IP | Optionnelle, voir plus bas. Appliquée à toutes les requêtes, tunnel compris. |
 | HTTPS | Certificat auto-signé généré au premier démarrage, ou vos propres certificats. |
-| Défense en profondeur | Chromium protégé par un mot de passe interne que la passerelle injecte automatiquement ; conteneur passerelle en lecture seule, non-root. |
+| Isolation | guacd et le bureau sont sur un réseau Docker interne ; le tunnel est lié à votre session et à un jeton propre ; mot de passe VNC interne ; Chromium tourne en utilisateur non-root avec son bac à sable ; passerelle en lecture seule. |
 
 ## Installation sur le NAS
 
@@ -37,7 +42,7 @@ profitez de sa connexion Internet sans les restrictions du réseau où vous vous
 git clone https://github.com/nathan33670-spec/miniature-web-browser.git
 cd miniature-web-browser
 cp .env.example .env
-mkdir -p data/gateway data/chromium   # certains NAS (Synology) ne les créent pas seuls
+mkdir -p data/gateway data/desktop   # certains NAS (Synology) ne les créent pas seuls
 docker compose build
 ```
 
@@ -57,7 +62,7 @@ docker compose run --rm --no-deps gateway generate-totp
 
 Copiez `TOTP_SECRET=...` dans `.env` et ajoutez la clé dans votre application d'authentification.
 
-**3. Mot de passe interne Chromium** : mettez une valeur aléatoire dans `INTERNAL_BROWSER_PASSWORD`
+**3. Mot de passe interne** (entre guacd et le bureau) : mettez une valeur aléatoire dans `INTERNAL_BROWSER_PASSWORD`
 (`openssl rand -hex 32`). Vous n'aurez jamais à la saisir.
 
 **4. Droits des fichiers** : réglez `PUID` / `PGID` sur l'utilisateur propriétaire du dossier
@@ -121,7 +126,9 @@ via la passerelle Docker.
 
 1. Pointez le reverse proxy vers `https://IP-DU-NAS:8443` (ou `TLS_MODE=off` et `http://…`
    si le reverse proxy est sur le même réseau et assure lui-même le HTTPS).
-2. **Activez le support WebSocket** dans le reverse proxy (indispensable pour l'affichage).
+2. Pas besoin de WebSocket. Si possible, augmentez le délai de lecture du proxy
+   (Synology : Paramètres avancés → 3600 s) et désactivez la mise en tampon des réponses
+   (la passerelle envoie `X-Accel-Buffering: no`, respecté par nginx).
 3. Déclarez l'IP du reverse proxy vue par le conteneur pour que l'IP réelle du client soit
    utilisée par la restriction IP et l'anti-bruteforce :
 
@@ -141,20 +148,39 @@ TLS_CERT_FILE=/data/tls/fullchain.pem
 TLS_KEY_FILE=/data/tls/privkey.pem
 ```
 
+## Utilisation
+
+- **Clavier et souris** sont transmis directement ; l'écran distant s'adapte à la taille de votre
+  fenêtre.
+- **Menu** (bouton `⋯` en haut à droite) : plein écran, envoi de texte dans le presse-papiers
+  distant, reconnexion, déconnexion.
+- **Presse-papiers** : ce qui est copié dans Chromium arrive dans votre presse-papiers ; votre
+  presse-papiers est envoyé quand la page reprend le focus (si le navigateur l'autorise), sinon
+  utilisez « Envoyer du texte… ».
+- En cas de coupure réseau, la page se reconnecte automatiquement.
+- Les raccourcis réservés par votre navigateur local (Ctrl+W, Ctrl+T…) restent captés par lui :
+  utilisez le mode plein écran ou les menus de Chromium.
+- Pas de son (le flux audio n'est pas transmis).
+
 ## Configuration de Chromium
 
-- **Page d'accueil / options** : `CHROME_CLI=https://www.google.fr` (accepte aussi des options
-  Chromium).
-- **Profil persistant** (favoris, historique, extensions, sessions) : `./data/chromium`.
+- **Page d'accueil** : `START_URL=https://www.google.fr`.
+- **Options Chromium supplémentaires** : `CHROMIUM_FLAGS=`.
+- **Taille d'écran initiale** : `SCREEN_RESOLUTION=1600x900` (elle suit ensuite votre fenêtre).
+- **Profil persistant** (favoris, historique, mots de passe, extensions) : `./data/desktop`.
 - **Langue / fuseau** : `BROWSER_LOCALE`, `TZ`.
 
 ## Mise à jour
 
 ```bash
 git pull
-docker compose pull chromium
-docker compose up -d --build
+docker compose pull guacd
+docker compose build --pull
+docker compose up -d
 ```
+
+`docker compose build --pull` reconstruit aussi l'image du bureau avec la dernière version de
+Chromium publiée par Debian : relancez-le régulièrement pour les correctifs de sécurité.
 
 ## Référence des variables
 
@@ -164,5 +190,5 @@ Toutes les variables sont documentées dans [`.env.example`](.env.example).
 
 ```bash
 cd gateway
-npm test     # tests unitaires et d'intégration (Node ≥ 20, aucune dépendance)
+npm install && npm test     # tests unitaires et d'intégration (Node ≥ 20)
 ```

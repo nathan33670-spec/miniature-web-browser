@@ -9,27 +9,39 @@ const crypto = require('node:crypto');
 const { loadConfig } = require('../src/config');
 const { createGateway } = require('../src/server');
 const { hashPassword, hotp, base32Decode, generateTotpSecret } = require('../src/auth');
+const { InstructionParser, encodeInstruction } = require('../src/guac');
 
 const silent = { debug() {}, info() {}, warn() {}, error() {} };
 
-/** Faux navigateur amont : HTTP + WebSocket (écho brut après handshake). */
-function startUpstream() {
-  const seen = [];
-  const server = http.createServer((req, res) => {
-    seen.push({ url: req.url, headers: req.headers });
-    res.writeHead(200, { 'content-type': 'text/plain', 'x-upstream': 'yes' });
-    res.end(`upstream:${req.method}:${req.url}`);
+/**
+ * Faux guacd : négociation VNC, puis envoie "sync" et répond "echo" à chaque
+ * instruction "test" reçue du navigateur.
+ */
+function startFakeGuacd() {
+  const state = { connects: [], sizes: [], received: [], sockets: new Set() };
+  const server = net.createServer((socket) => {
+    state.sockets.add(socket);
+    socket.on('close', () => state.sockets.delete(socket));
+    socket.setEncoding('utf8');
+    const parser = new InstructionParser();
+    socket.on('data', (chunk) => {
+      for (const ins of parser.push(chunk)) {
+        if (ins.opcode === 'select') {
+          socket.write(encodeInstruction('args', 'VERSION_1_5_0', 'hostname', 'port', 'password'));
+        } else if (ins.opcode === 'size') {
+          state.sizes.push(ins.args);
+        } else if (ins.opcode === 'connect') {
+          state.connects.push(ins.args);
+          socket.write(encodeInstruction('ready', '$fake') + encodeInstruction('sync', '1'));
+        } else {
+          state.received.push(ins);
+          if (ins.opcode === 'test') socket.write(encodeInstruction('echo', ...ins.args));
+        }
+      }
+    });
+    socket.on('error', () => {});
   });
-  server.on('upgrade', (req, socket) => {
-    seen.push({ url: req.url, headers: req.headers, ws: true });
-    const accept = crypto
-      .createHash('sha1')
-      .update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
-      .digest('base64');
-    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
-    socket.on('data', (d) => socket.write(d));
-  });
-  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, seen, port: server.address().port })));
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, state, port: server.address().port })));
 }
 
 function request(port, { method = 'GET', path = '/', headers = {}, body } = {}) {
@@ -45,38 +57,30 @@ function request(port, { method = 'GET', path = '/', headers = {}, body } = {}) 
   });
 }
 
-function wsHandshake(port, headers = {}) {
+function rawUpgrade(port) {
   return new Promise((resolve, reject) => {
     const socket = net.connect(port, '127.0.0.1', () => {
-      const lines = [
-        'GET /websockify HTTP/1.1',
-        `Host: 127.0.0.1:${port}`,
-        'Upgrade: websocket',
-        'Connection: Upgrade',
-        `Sec-WebSocket-Key: ${crypto.randomBytes(16).toString('base64')}`,
-        'Sec-WebSocket-Version: 13',
-        ...Object.entries(headers).map(([k, v]) => `${k}: ${v}`),
-      ];
-      socket.write(lines.join('\r\n') + '\r\n\r\n');
+      socket.write(
+        'GET /tunnel HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
+          `Sec-WebSocket-Key: ${crypto.randomBytes(16).toString('base64')}\r\nSec-WebSocket-Version: 13\r\n\r\n`
+      );
     });
     let buf = '';
-    socket.on('data', function onData(d) {
-      buf += d.toString();
-      if (buf.includes('\r\n\r\n')) {
-        socket.removeListener('data', onData);
-        resolve({ socket, status: Number(buf.split(' ')[1]), raw: buf });
-      }
-    });
+    socket.on('data', (d) => (buf += d));
+    socket.on('close', () => resolve(Number(buf.split(' ')[1])));
     socket.on('error', reject);
   });
 }
 
 async function setup(env = {}) {
-  const upstream = await startUpstream();
+  const guacd = await startFakeGuacd();
   const config = loadConfig({
     AUTH_USERNAME: 'nathan',
     AUTH_PASSWORD_HASH: await hashPassword('motdepasse-solide', { N: 1024, r: 8, p: 1, keyLen: 32 }),
-    UPSTREAM_URL: `http://127.0.0.1:${upstream.port}`,
+    GUACD_HOST: '127.0.0.1',
+    GUACD_PORT: String(guacd.port),
+    DESKTOP_HOST: 'desktop',
+    DESKTOP_VNC_PASSWORD: 'secret',
     TLS_MODE: 'off',
     LOGIN_FAILURE_DELAY_MS: '0',
     PUBLIC_IP_AUTODETECT: 'false',
@@ -86,19 +90,18 @@ async function setup(env = {}) {
   const { port } = await gateway.listen(0, '127.0.0.1');
   return {
     port,
-    upstream,
+    guacd,
     gateway,
     async close() {
       await gateway.close();
-      upstream.server.closeAllConnections();
-      // Les sockets « upgradés » ne sont pas comptés de façon fiable par close() : on n'attend pas.
-      upstream.server.close();
+      for (const s of guacd.state.sockets) s.destroy();
+      await new Promise((r) => guacd.server.close(r));
     },
   };
 }
 
 async function login(port, { username = 'nathan', password = 'motdepasse-solide', totp, headers = {} } = {}) {
-  const form = new URLSearchParams({ username, password, next: '/app?x=1' });
+  const form = new URLSearchParams({ username, password, next: '/' });
   if (totp) form.set('totp', totp);
   return request(port, {
     method: 'POST',
@@ -108,62 +111,153 @@ async function login(port, { username = 'nathan', password = 'motdepasse-solide'
   });
 }
 
-test('flux complet : redirection, connexion, proxy HTTP et WebSocket, déconnexion', async () => {
+async function loggedIn(port) {
+  const res = await login(port);
+  assert.equal(res.status, 303);
+  return res.headers['set-cookie'][0].split(';')[0];
+}
+
+async function openTunnel(port, cookie) {
+  const res = await request(port, {
+    method: 'POST',
+    path: '/tunnel?connect',
+    headers: { cookie, 'content-type': 'application/x-www-form-urlencoded' },
+    body: 'width=1280&height=720&dpi=96&timezone=Europe/Paris',
+  });
+  return { ...res, uuid: res.body, token: res.headers['guacamole-tunnel-token'] };
+}
+
+test('flux complet : connexion, page client, tunnel HTTP lecture/écriture, déconnexion', async () => {
   const ctx = await setup();
   try {
     const anon = await request(ctx.port, { headers: { accept: 'text/html' } });
     assert.equal(anon.status, 302);
     assert.match(anon.headers.location, /^\/__auth\/login\?next=/);
-
-    const api = await request(ctx.port, { path: '/data' });
-    assert.equal(api.status, 401);
-
-    const page = await request(ctx.port, { path: '/__auth/login' });
-    assert.equal(page.status, 200);
-    assert.match(page.body, /<form/);
-    assert.match(page.headers['content-security-policy'], /frame-ancestors 'none'/);
+    assert.equal((await request(ctx.port, { method: 'POST', path: '/tunnel?connect' })).status, 401);
 
     const bad = await login(ctx.port, { password: 'faux' });
     assert.equal(bad.status, 401);
-    assert.match(bad.body, /invalides/);
 
-    const ok = await login(ctx.port);
-    assert.equal(ok.status, 303);
-    assert.equal(ok.headers.location, '/app?x=1');
-    const setCookie = ok.headers['set-cookie'][0];
-    assert.match(setCookie, /HttpOnly/);
-    assert.match(setCookie, /SameSite=Strict/);
-    const cookie = setCookie.split(';')[0];
+    const cookie = await loggedIn(ctx.port);
 
-    const proxied = await request(ctx.port, { path: '/app?x=1', headers: { cookie: `${cookie}; other=1` } });
-    assert.equal(proxied.status, 200);
-    assert.equal(proxied.body, 'upstream:GET:/app?x=1');
-    assert.equal(proxied.headers['x-upstream'], 'yes');
-    const seen = ctx.upstream.seen.at(-1);
-    assert.equal(seen.headers.cookie, 'other=1', 'le cookie de session ne fuit pas vers l\'amont');
-    assert.equal(seen.headers['x-forwarded-for'], '127.0.0.1');
+    const page = await request(ctx.port, { headers: { cookie } });
+    assert.equal(page.status, 200);
+    assert.match(page.body, /client\.js/);
+    assert.match(page.headers['content-security-policy'], /script-src 'self'/);
 
-    const wsAnon = await wsHandshake(ctx.port);
-    assert.equal(wsAnon.status, 401);
-    wsAnon.socket.destroy();
+    const lib = await request(ctx.port, { path: '/static/guacamole-common.js', headers: { cookie, 'accept-encoding': 'gzip' } });
+    assert.equal(lib.status, 200);
+    assert.equal(lib.headers['content-encoding'], 'gzip');
+    const notModified = await request(ctx.port, { path: '/static/client.js', headers: { cookie, 'if-none-match': (await request(ctx.port, { path: '/static/client.js', headers: { cookie } })).headers.etag } });
+    assert.equal(notModified.status, 304);
 
-    const ws = await wsHandshake(ctx.port, { Cookie: cookie });
-    assert.equal(ws.status, 101);
-    const echoed = await new Promise((resolve) => {
-      ws.socket.once('data', (d) => resolve(d.toString()));
-      ws.socket.write('ping');
+    // Ouverture du tunnel
+    const tunnel = await openTunnel(ctx.port, cookie);
+    assert.equal(tunnel.status, 200);
+    assert.match(tunnel.uuid, /^[0-9a-f-]{36}$/);
+    assert.ok(tunnel.token);
+    assert.deepEqual(ctx.guacd.state.sizes[0], ['1280', '720', '96']);
+    assert.deepEqual(ctx.guacd.state.connects[0], ['VERSION_1_5_0', 'desktop', '5900', 'secret']);
+
+    const tunnelHeaders = { cookie, 'guacamole-tunnel-token': tunnel.token };
+
+    // Lecture : la réponse se termine d'elle-même par "0.;" (compatible proxys qui bufferisent)
+    const read1 = await request(ctx.port, { path: `/tunnel?read:${tunnel.uuid}:0`, headers: tunnelHeaders });
+    assert.equal(read1.status, 200);
+    assert.equal(read1.headers['x-accel-buffering'], 'no');
+    assert.equal(read1.body, '4.sync,1.1;0.;');
+
+    // Écriture puis lecture de la réponse
+    const write = await request(ctx.port, {
+      method: 'POST',
+      path: `/tunnel?write:${tunnel.uuid}`,
+      headers: { ...tunnelHeaders, 'content-type': 'application/octet-stream' },
+      body: '3.nop;4.test,5.hello;',
     });
-    assert.equal(echoed, 'ping');
+    assert.equal(write.status, 200);
+    const read2 = await request(ctx.port, { path: `/tunnel?read:${tunnel.uuid}:1`, headers: tunnelHeaders });
+    assert.equal(read2.body, '4.echo,5.hello;0.;');
+    assert.deepEqual(ctx.guacd.state.received.map((i) => i.opcode), ['audio', 'video', 'image', 'timezone', 'nop', 'test']);
+    assert.deepEqual(ctx.guacd.state.received.find((i) => i.opcode === 'timezone').args, ['Europe/Paris']);
 
-    const closed = new Promise((r) => ws.socket.once('close', r));
-    const out = await request(ctx.port, { path: '/__auth/logout', headers: { cookie } });
-    assert.equal(out.status, 303);
-    await closed; // la déconnexion coupe les WebSockets de la session
+    // Mauvais jeton ou autre session : refus
+    const wrongToken = await request(ctx.port, { path: `/tunnel?read:${tunnel.uuid}:2`, headers: { cookie, 'guacamole-tunnel-token': 'x' } });
+    assert.equal(wrongToken.status, 403);
+    assert.equal(wrongToken.headers['guacamole-status-code'], String(0x0303));
+    const otherCookie = await loggedIn(ctx.port);
+    const otherSession = await request(ctx.port, {
+      path: `/tunnel?read:${tunnel.uuid}:2`,
+      headers: { cookie: otherCookie, 'guacamole-tunnel-token': tunnel.token },
+    });
+    assert.equal(otherSession.status, 403);
+    const unknown = await request(ctx.port, { path: `/tunnel?read:${crypto.randomUUID()}:0`, headers: tunnelHeaders });
+    assert.equal(unknown.status, 404);
+    assert.equal(unknown.headers['guacamole-status-code'], String(0x0204));
 
-    const after = await request(ctx.port, { path: '/data', headers: { cookie } });
-    assert.equal(after.status, 401);
+    // Les WebSockets ne sont plus acceptés
+    assert.equal(await rawUpgrade(ctx.port), 404);
+
+    // Déconnexion : le tunnel et la connexion guacd sont fermés
+    const guacdClosed = new Promise((resolve) => {
+      const [sock] = ctx.guacd.state.sockets;
+      sock.once('close', resolve);
+    });
+    await request(ctx.port, { path: '/__auth/logout', headers: { cookie } });
+    await guacdClosed;
+    assert.equal((await request(ctx.port, { path: `/tunnel?read:${tunnel.uuid}:3`, headers: tunnelHeaders })).status, 401);
   } finally {
     await ctx.close();
+  }
+});
+
+test('une nouvelle lecture termine proprement la précédente (lectures en parallèle)', async () => {
+  const ctx = await setup();
+  try {
+    const cookie = await loggedIn(ctx.port);
+    const tunnel = await openTunnel(ctx.port, cookie);
+    const headers = { cookie, 'guacamole-tunnel-token': tunnel.token };
+    await request(ctx.port, { path: `/tunnel?read:${tunnel.uuid}:0`, headers }); // vide la file
+    const first = request(ctx.port, { path: `/tunnel?read:${tunnel.uuid}:1`, headers });
+    await new Promise((r) => setTimeout(r, 50));
+    const second = request(ctx.port, { path: `/tunnel?read:${tunnel.uuid}:2`, headers });
+    await new Promise((r) => setTimeout(r, 50));
+    await request(ctx.port, { method: 'POST', path: `/tunnel?write:${tunnel.uuid}`, headers, body: '4.test,1.x;' });
+    assert.equal((await first).body, '0.;');
+    assert.equal((await second).body, '4.echo,1.x;0.;');
+  } finally {
+    await ctx.close();
+  }
+});
+
+test('fermeture côté guacd : les données restantes sont livrées puis 404', async () => {
+  const ctx = await setup();
+  try {
+    const cookie = await loggedIn(ctx.port);
+    const tunnel = await openTunnel(ctx.port, cookie);
+    const headers = { cookie, 'guacamole-tunnel-token': tunnel.token };
+    const [sock] = ctx.guacd.state.sockets;
+    sock.end(encodeInstruction('disconnect'));
+    await new Promise((r) => setTimeout(r, 50));
+    const last = await request(ctx.port, { path: `/tunnel?read:${tunnel.uuid}:0`, headers });
+    assert.equal(last.body, '4.sync,1.1;10.disconnect;0.;');
+    const after = await request(ctx.port, { path: `/tunnel?read:${tunnel.uuid}:1`, headers });
+    assert.equal(after.status, 404);
+  } finally {
+    await ctx.close();
+  }
+});
+
+test('guacd injoignable : erreur 503 compréhensible par le client', async () => {
+  const ctx = await setup();
+  try {
+    const cookie = await loggedIn(ctx.port);
+    for (const s of ctx.guacd.state.sockets) s.destroy();
+    await new Promise((r) => ctx.guacd.server.close(r));
+    const res = await openTunnel(ctx.port, cookie);
+    assert.equal(res.status, 503);
+    assert.equal(res.headers['guacamole-status-code'], String(0x0207));
+  } finally {
+    await ctx.gateway.close();
   }
 });
 
@@ -216,16 +310,13 @@ test('restriction IP : liste blanche, IP publique du serveur et localhost', asyn
   });
   try {
     await ctx.gateway.publicIp.refresh();
-    const via = (ip) => request(ctx.port, { path: '/__auth/login', headers: { 'x-forwarded-for': ip } });
+    const via = (ip, path = '/__auth/login') => request(ctx.port, { path, headers: { 'x-forwarded-for': ip } });
 
     assert.equal((await via('8.8.8.8')).status, 403);
+    assert.equal((await via('8.8.8.8', '/tunnel?connect')).status, 403);
     assert.equal((await via('198.51.100.9')).status, 200);
     assert.equal((await via('203.0.113.7')).status, 200);
     assert.equal((await request(ctx.port, { path: '/__auth/login' })).status, 200, 'localhost toujours autorisé');
-
-    const ws = await wsHandshake(ctx.port, { 'X-Forwarded-For': '8.8.8.8' });
-    assert.equal(ws.status, 403);
-    ws.socket.destroy();
   } finally {
     await ctx.close();
   }
@@ -234,7 +325,6 @@ test('restriction IP : liste blanche, IP publique du serveur et localhost', asyn
 test('X-Forwarded-For ignoré si la connexion ne vient pas d\'un proxy de confiance', async () => {
   const ctx = await setup({ IP_RESTRICTION_ENABLED: 'true', TRUSTED_PROXIES: '10.9.9.9' });
   try {
-    // Le client est 127.0.0.1 (autorisé) : l'en-tête usurpé ne doit pas le faire passer pour une autre IP.
     const res = await request(ctx.port, { path: '/__auth/login', headers: { 'x-forwarded-for': '8.8.8.8' } });
     assert.equal(res.status, 200);
   } finally {
@@ -242,17 +332,16 @@ test('X-Forwarded-For ignoré si la connexion ne vient pas d\'un proxy de confia
   }
 });
 
-test('IPV4_ONLY : client IPv6 relayé par un proxy refusé, y compris en WebSocket', async () => {
+test('IPV4_ONLY : client IPv6 relayé par un proxy refusé, y compris sur le tunnel', async () => {
   const ctx = await setup({ TRUSTED_PROXIES: '127.0.0.1' });
   try {
     const v6 = await request(ctx.port, { path: '/__auth/login', headers: { 'x-forwarded-for': '2001:db8::1' } });
     assert.equal(v6.status, 403);
     assert.match(v6.body, /IPv4/);
+    const tunnel = await request(ctx.port, { method: 'POST', path: '/tunnel?connect', headers: { 'x-forwarded-for': '2001:db8::1' } });
+    assert.equal(tunnel.status, 403);
     const v4 = await request(ctx.port, { path: '/__auth/login', headers: { 'x-forwarded-for': '198.51.100.1' } });
     assert.equal(v4.status, 200);
-    const ws = await wsHandshake(ctx.port, { 'X-Forwarded-For': '2001:db8::1' });
-    assert.equal(ws.status, 403);
-    ws.socket.destroy();
   } finally {
     await ctx.close();
   }
@@ -265,20 +354,5 @@ test('IPV4_ONLY=false : un client IPv6 est accepté', async () => {
     assert.equal(v6.status, 200);
   } finally {
     await ctx.close();
-  }
-});
-
-test('502 lisible quand le navigateur est arrêté', async () => {
-  const ctx = await setup();
-  try {
-    const ok = await login(ctx.port);
-    const cookie = ok.headers['set-cookie'][0].split(';')[0];
-    ctx.upstream.server.closeAllConnections();
-    await new Promise((r) => ctx.upstream.server.close(r));
-    const res = await request(ctx.port, { path: '/', headers: { cookie } });
-    assert.equal(res.status, 502);
-    assert.match(res.body, /Navigateur indisponible/);
-  } finally {
-    await ctx.gateway.close();
   }
 });

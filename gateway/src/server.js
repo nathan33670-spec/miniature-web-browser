@@ -8,7 +8,8 @@ const https = require('node:https');
 const { AccessControl, IpSet, resolveClientIp, detectDockerGateways, normalizeIp } = require('./ipfilter');
 const { verifyPassword, hashPassword, safeEqual, TotpVerifier, SessionStore, LoginLimiter } = require('./auth');
 const { PublicIpTracker } = require('./publicip');
-const { Proxy } = require('./proxy');
+const { TunnelManager } = require('./guac');
+const { loadAssets, serveAsset } = require('./static');
 const { loginPage, messagePage } = require('./pages');
 
 const AUTH_PREFIX = '/__auth/';
@@ -59,6 +60,10 @@ function readBody(req, limit = MAX_BODY) {
   });
 }
 
+const CLIENT_CSP =
+  "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; " +
+  "connect-src 'self'; media-src 'self' blob:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function securityHeaders(extra = {}) {
@@ -106,7 +111,22 @@ async function createGateway(config, { logger = createLogger(config.logLevel), d
   const totp = config.auth.totpSecret ? new TotpVerifier(config.auth.totpSecret) : null;
   const sessions = new SessionStore(config.session);
   const limiter = new LoginLimiter(config.login);
-  const proxy = new Proxy({ ...config.upstream, cookieName: config.session.cookieName });
+  const assets = loadAssets();
+  const tunnels = new TunnelManager({
+    guacd: config.guacd,
+    connection: {
+      protocol: 'vnc',
+      params: {
+        hostname: config.desktop.host,
+        port: String(config.desktop.port),
+        password: config.desktop.password,
+        'color-depth': '24',
+        'clipboard-encoding': 'UTF-8',
+        autoretry: '10',
+      },
+    },
+    logger,
+  });
   const tlsEnabled = config.tls.mode !== 'off';
 
   function context(req) {
@@ -240,7 +260,8 @@ async function createGateway(config, { logger = createLogger(config.logLevel), d
 
     if (url.pathname.startsWith(AUTH_PREFIX)) return handleAuthRoute(req, res, ctx, url);
 
-    if (!sessions.get(getToken(req))) {
+    const session = sessions.get(getToken(req));
+    if (!session) {
       const wantsHtml = req.method === 'GET' && String(req.headers.accept || '').includes('text/html');
       if (wantsHtml) {
         return send(res, 302, '', { location: `/__auth/login?next=${encodeURIComponent(safeNext(req.url))}` });
@@ -248,36 +269,25 @@ async function createGateway(config, { logger = createLogger(config.logLevel), d
       return send(res, 401, 'Authentification requise', { 'content-type': 'text/plain; charset=utf-8' });
     }
 
-    proxy.web(req, res, ctx, (err) => {
-      logger.error(`Erreur vers le navigateur (${config.upstream.url}) : ${err.message}`);
-      if (!res.headersSent) {
-        send(res, 502, messagePage('Navigateur indisponible', 'Le navigateur démarre ou est arrêté. Réessayez dans quelques secondes.'), {
-          refresh: '5',
-        });
-      } else {
-        res.destroy();
-      }
-    });
+    // Tunnel d'affichage Guacamole (HTTP uniquement, aucun WebSocket).
+    if (url.pathname === '/tunnel') {
+      const tunnel = await tunnels.handle(req, res, url, session, ctx);
+      if (tunnel) sessions.attachSocket(session, tunnel);
+      return;
+    }
+
+    const asset = (req.method === 'GET' || req.method === 'HEAD') && assets.get(url.pathname);
+    if (asset) {
+      return serveAsset(req, res, asset, url.pathname === '/' ? { 'content-security-policy': CLIENT_CSP, 'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer' } : {});
+    }
+    return send(res, 404, messagePage('Introuvable', ''));
   }
 
-  function onUpgrade(req, socket, head) {
+  // Aucun WebSocket n'est utilisé : toute demande d'upgrade est refusée.
+  function onUpgrade(req, socket) {
     socket.on('error', () => {});
-    const reject = (status, text) => {
-      socket.end(`HTTP/1.1 ${status} ${text}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n`);
-      socket.destroy();
-    };
-    const ctx = context(req);
-    if (!familyAllowed(ctx.clientIp)) {
-      logger.warn(`WebSocket refusé pour ${ctx.clientIp} (IPv6 désactivé)`);
-      return reject(403, 'Forbidden');
-    }
-    if (!access.check(ctx.clientIp)) {
-      logger.warn(`WebSocket refusé pour ${ctx.clientIp} (hors liste blanche)`);
-      return reject(403, 'Forbidden');
-    }
-    const session = sessions.get(getToken(req));
-    if (!session) return reject(401, 'Unauthorized');
-    proxy.ws(req, socket, head, ctx, () => sessions.attachSocket(session, socket));
+    socket.end('HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n');
+    socket.destroy();
   }
 
   const handler = (req, res) =>
@@ -312,6 +322,7 @@ async function createGateway(config, { logger = createLogger(config.logLevel), d
     access,
     sessions,
     limiter,
+    tunnels,
     publicIp,
     gateways,
     async listen(port = config.listen.port, host = config.listen.host) {
@@ -324,6 +335,7 @@ async function createGateway(config, { logger = createLogger(config.logLevel), d
     },
     async close() {
       clearInterval(sweeper);
+      tunnels.closeAll();
       if (publicIp) publicIp.stop();
       for (const key of [...sessions.sessions.keys()]) sessions.destroyByKey(key);
       server.closeAllConnections?.();

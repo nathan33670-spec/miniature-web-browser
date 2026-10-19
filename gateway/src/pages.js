@@ -30,6 +30,7 @@ function layout(title, body) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>${escapeHtml(title)}</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 48 48%27%3E%3Ccircle cx=%2724%27 cy=%2724%27 r=%2722%27 fill=%27%232563eb%27/%3E%3Ccircle cx=%2724%27 cy=%2724%27 r=%279%27 fill=%27%23fff%27/%3E%3C/svg%3E">
 <style>${STYLE}</style>
 </head>
 <body><main>${LOGO}${body}</main></body>

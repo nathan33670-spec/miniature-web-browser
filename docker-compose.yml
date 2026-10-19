@@ -1,9 +1,16 @@
 name: remote-browser
 
+# Architecture (aucun WebSocket : l'affichage passe par un tunnel HTTP Guacamole)
+#
+#   Internet --HTTPS--> gateway --(guacamole)--> guacd --(VNC)--> desktop (Chromium)
+#
+# Seule la passerelle publie un port. guacd n'est joignable que sur le réseau
+# interne "backend" ; le conteneur desktop a en plus un accès Internet ("egress").
+
 services:
   # ---------------------------------------------------------------------------
-  # Passerelle : seul point d'entrée exposé. Gère HTTPS, l'authentification,
-  # la restriction par IP et relaie le flux (HTTP + WebSocket) vers Chromium.
+  # Passerelle : HTTPS, authentification, restriction IP, page d'affichage et
+  # tunnel HTTP vers guacd.
   # ---------------------------------------------------------------------------
   gateway:
     build: ./gateway
@@ -12,18 +19,22 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      UPSTREAM_URL: http://chromium:3000
-      UPSTREAM_USERNAME: ${INTERNAL_BROWSER_USER:-abc}
-      UPSTREAM_PASSWORD: ${INTERNAL_BROWSER_PASSWORD:-}
+      GUACD_HOST: guacd
+      GUACD_PORT: "4822"
+      DESKTOP_HOST: desktop
+      DESKTOP_VNC_PORT: "5900"
+      DESKTOP_VNC_PASSWORD: ${INTERNAL_BROWSER_PASSWORD:-}
     ports:
       # Publié en IPv4 uniquement : aucune écoute IPv6 sur le NAS.
       - "0.0.0.0:${GATEWAY_PORT:-8443}:8443"
     volumes:
       - ./data/gateway:/data
     depends_on:
-      - chromium
+      - guacd
+      - desktop
     networks:
-      - browser
+      - front
+      - backend
     read_only: true
     tmpfs:
       - /tmp
@@ -31,35 +42,53 @@ services:
       - no-new-privileges:true
 
   # ---------------------------------------------------------------------------
-  # Navigateur : Chromium affiché dans le navigateur web (image linuxserver.io).
-  # AUCUN port publié : il n'est joignable qu'à travers la passerelle.
+  # guacd : traduit la session VNC en protocole Guacamole.
   # ---------------------------------------------------------------------------
-  chromium:
-    image: ${CHROMIUM_IMAGE:-lscr.io/linuxserver/chromium:latest}
-    container_name: remote-browser-chromium
+  guacd:
+    image: ${GUACD_IMAGE:-guacamole/guacd:1.6.0}
+    container_name: remote-browser-guacd
+    restart: unless-stopped
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+
+  # ---------------------------------------------------------------------------
+  # Bureau : Chromium (Debian) dans une session TigerVNC. Aucun port publié.
+  # ---------------------------------------------------------------------------
+  desktop:
+    build: ./desktop
+    image: remote-browser-desktop:latest
+    container_name: remote-browser-desktop
+    hostname: remote-browser
     restart: unless-stopped
     environment:
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
       TZ: ${TZ:-Europe/Paris}
-      LC_ALL: ${BROWSER_LOCALE:-fr_FR.UTF-8}
-      TITLE: Navigateur distant
-      CHROME_CLI: ${CHROME_CLI:-https://www.google.fr}
-      # IPv6 désactivé aussi côté navigateur (écoute interne en IPv4 seulement).
-      DISABLE_IPV6: "true"
-      # Mot de passe interne (défense en profondeur) : la passerelle l'injecte
-      # automatiquement, vous n'avez jamais à le saisir.
-      CUSTOM_USER: ${INTERNAL_BROWSER_USER:-abc}
-      PASSWORD: ${INTERNAL_BROWSER_PASSWORD:-}
+      LANG: ${BROWSER_LOCALE:-fr_FR.UTF-8}
+      SCREEN_RESOLUTION: ${SCREEN_RESOLUTION:-1600x900}
+      START_URL: ${START_URL:-https://www.google.fr}
+      CHROMIUM_FLAGS: ${CHROMIUM_FLAGS:-}
+      VNC_PASSWORD: ${INTERNAL_BROWSER_PASSWORD:-}
     volumes:
-      - ./data/chromium:/config
+      - ./data/desktop:/data
     shm_size: "1gb"
     security_opt:
+      # Permet au bac à sable de Chromium de fonctionner dans le conteneur.
       - seccomp:unconfined
     networks:
-      - browser
+      - backend
+      - egress
 
 networks:
-  browser:
+  front:
+    driver: bridge
+    enable_ipv6: false
+  backend:
+    driver: bridge
+    internal: true
+    enable_ipv6: false
+  egress:
     driver: bridge
     enable_ipv6: false
