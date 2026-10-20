@@ -1,18 +1,21 @@
 'use strict';
 
 /**
- * Tunnel HTTP Guacamole (sans WebSocket).
+ * Tunnel HTTP Guacamole « pipeliné » (sans WebSocket).
  *
- * Implémente côté serveur le protocole attendu par Guacamole.HTTPTunnel :
- *   POST /tunnel?connect           -> ouvre une session guacd, renvoie l'UUID
- *   GET  /tunnel?read:<uuid>:<n>   -> flux d'instructions (réponse terminée par "0.;")
- *   POST /tunnel?write:<uuid>      -> instructions envoyées par le navigateur
+ *   POST /tunnel?connect              -> ouvre une session guacd, renvoie l'UUID
+ *   GET  /tunnel?read:<uuid>:<n>      -> lot d'instructions n (réponse terminée par "0.;")
+ *   POST /tunnel?write:<uuid>:<n>     -> lot d'instructions n envoyé par le navigateur
  *
- * Chaque réponse de lecture est volontairement courte : un proxy d'entreprise
- * qui met les réponses en tampon laisse donc quand même passer l'image.
+ * Le navigateur garde plusieurs lectures et écritures en vol en même temps ; le
+ * serveur les traite strictement dans l'ordre de leur numéro. Chaque réponse
+ * est courte (fin d'image ou quelques dizaines de ms), complète et compressée :
+ * un proxy d'entreprise qui met les réponses en tampon ou ajoute de la latence
+ * ne bloque donc plus le flux.
  */
 
 const net = require('node:net');
+const zlib = require('node:zlib');
 const crypto = require('node:crypto');
 const { EventEmitter } = require('node:events');
 const { safeEqual } = require('./auth');
@@ -30,9 +33,12 @@ const STATUS = {
 
 const END_OF_RESPONSE = '0.;';
 const MAX_PENDING_INSTRUCTION = 32 * 1024 * 1024;
+const SURROGATE = /[\ud800-\udbff]/;
 
 // ---------------------------------------------------------------------------
-// Protocole Guacamole : "LONGUEUR.VALEUR,LONGUEUR.VALEUR;" (longueurs en points de code)
+// Protocole Guacamole : "LONGUEUR.VALEUR,LONGUEUR.VALEUR;"
+// guacd compte les longueurs en points de code Unicode, le client JavaScript en
+// unités UTF-16 : la passerelle convertit dans les deux sens si nécessaire.
 // ---------------------------------------------------------------------------
 
 function codepointLength(str) {
@@ -45,15 +51,21 @@ function codepointLength(str) {
   return n;
 }
 
+/** Encodage pour guacd (points de code). */
 function encodeInstruction(...elements) {
   return elements.map((e) => `${codepointLength(String(e))}.${e}`).join(',') + ';';
+}
+
+/** Encodage pour le navigateur (unités UTF-16). */
+function encodeInstructionUtf16(...elements) {
+  return elements.map((e) => `${String(e).length}.${e}`).join(',') + ';';
 }
 
 /** Index situé `count` points de code après `start`, ou -1 si les données sont incomplètes. */
 function skipCodepoints(str, start, count) {
   const fastEnd = start + count;
   if (fastEnd > str.length) return -1;
-  if (!/[\ud800-\udbff]/.test(str.slice(start, fastEnd))) return fastEnd;
+  if (!SURROGATE.test(str.slice(start, fastEnd))) return fastEnd;
   let i = start;
   for (let n = 0; n < count; n++) {
     if (i >= str.length) return -1;
@@ -63,9 +75,16 @@ function skipCodepoints(str, start, count) {
   return i > str.length ? -1 : i;
 }
 
+function skipUtf16(str, start, count) {
+  const end = start + count;
+  return end > str.length ? -1 : end;
+}
+
 class InstructionParser {
-  constructor() {
+  /** @param {{ units?: 'codepoint' | 'utf16' }} options */
+  constructor({ units = 'codepoint' } = {}) {
     this.buffer = '';
+    this.skip = units === 'utf16' ? skipUtf16 : skipCodepoints;
   }
 
   /** Ajoute des données et retourne les instructions complètes ({ opcode, args, raw }). */
@@ -84,7 +103,7 @@ class InstructionParser {
         }
         const lengthText = buf.slice(pos, dot);
         if (!/^\d{1,10}$/.test(lengthText)) throw new Error('Instruction Guacamole invalide');
-        const end = skipCodepoints(buf, dot + 1, Number(lengthText));
+        const end = this.skip(buf, dot + 1, Number(lengthText));
         if (end === -1 || end >= buf.length) break outer;
         elements.push(buf.slice(dot + 1, end));
         const terminator = buf[end];
@@ -101,6 +120,16 @@ class InstructionParser {
     if (this.buffer.length > MAX_PENDING_INSTRUCTION) throw new Error('Instruction Guacamole trop longue');
     return out;
   }
+}
+
+/** Instruction guacd -> texte pour le navigateur. */
+function toBrowser(ins) {
+  return SURROGATE.test(ins.raw) ? encodeInstructionUtf16(ins.opcode, ...ins.args) : ins.raw;
+}
+
+/** Instruction du navigateur -> texte pour guacd. */
+function toGuacd(ins) {
+  return SURROGATE.test(ins.raw) ? encodeInstruction(ins.opcode, ...ins.args) : ins.raw;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +177,7 @@ function connectGuacd({ host, port, protocol, params, size, timezone, timeoutMs 
             encodeInstruction('size', size.width, size.height, size.dpi) +
               encodeInstruction('audio') +
               encodeInstruction('video') +
-              encodeInstruction('image', 'image/png', 'image/jpeg', 'image/webp') +
+              encodeInstruction('image', 'image/webp', 'image/jpeg', 'image/png') +
               (timezone ? encodeInstruction('timezone', timezone) : '') +
               encodeInstruction('connect', ...values)
           );
@@ -158,7 +187,7 @@ function connectGuacd({ host, port, protocol, params, size, timezone, timeoutMs 
           socket.removeAllListeners('data');
           socket.removeAllListeners('error');
           socket.removeAllListeners('close');
-          return resolve({ socket, parser, initial: instructions.slice(i + 1).map((x) => x.raw) });
+          return resolve({ socket, parser, initial: instructions.slice(i + 1) });
         }
       }
     });
@@ -166,8 +195,15 @@ function connectGuacd({ host, port, protocol, params, size, timezone, timeoutMs 
 }
 
 // ---------------------------------------------------------------------------
-// Tunnel : file d'instructions guacd -> navigateur, lue par requêtes HTTP successives
+// Tunnel
 // ---------------------------------------------------------------------------
+
+const RESPONSE_HEADERS = {
+  'content-type': 'application/octet-stream',
+  'cache-control': 'no-cache, no-store, no-transform',
+  pragma: 'no-cache',
+  'x-accel-buffering': 'no',
+};
 
 class GuacTunnel extends EventEmitter {
   constructor({ socket, parser, initial = [], owner, options, logger }) {
@@ -176,14 +212,29 @@ class GuacTunnel extends EventEmitter {
     this.token = crypto.randomBytes(32).toString('base64url');
     this.socket = socket;
     this.parser = parser;
+    this.clientParser = new InstructionParser({ units: 'utf16' });
     this.owner = owner;
     this.options = options;
     this.logger = logger;
-    this.queue = [...initial];
-    this.queueBytes = this.queue.reduce((n, s) => n + s.length, 0);
-    this.reader = null;
     this.closed = false;
     this.lastActivity = Date.now();
+
+    // guacd -> navigateur
+    this.queue = [];
+    this.queueBytes = 0;
+    this.queueHasSync = false;
+    this.enqueue(initial);
+
+    // Lectures en attente, servies strictement dans l'ordre
+    this.nextReadSeq = 0;
+    this.pendingReads = new Map();
+    this.reader = null;
+    this.readGapTimer = null;
+
+    // Écritures, appliquées strictement dans l'ordre
+    this.nextWriteSeq = 0;
+    this.pendingWrites = new Map();
+    this.writeGapTimer = null;
 
     socket.on('data', (chunk) => {
       let instructions;
@@ -194,15 +245,23 @@ class GuacTunnel extends EventEmitter {
         this.destroy();
         return;
       }
-      for (const ins of instructions) {
-        this.queue.push(ins.raw);
-        this.queueBytes += ins.raw.length;
-      }
+      this.enqueue(instructions);
+      // Petite file : si le navigateur ne suit pas, guacd est freiné et regroupe
+      // les mises à jour au lieu d'accumuler du retard.
       if (this.queueBytes > this.options.maxQueueBytes) socket.pause();
-      this.flush();
+      this.pump();
     });
     socket.on('error', () => {});
     socket.on('close', () => this.markClosed());
+  }
+
+  enqueue(instructions) {
+    for (const ins of instructions) {
+      const text = toBrowser(ins);
+      this.queue.push(text);
+      this.queueBytes += text.length;
+      if (ins.opcode === 'sync') this.queueHasSync = true;
+    }
   }
 
   touch() {
@@ -212,73 +271,175 @@ class GuacTunnel extends EventEmitter {
   markClosed() {
     if (this.closed) return;
     this.closed = true;
-    this.flush();
+    this.pump();
     this.emit('close');
   }
 
-  /** Une nouvelle lecture remplace la précédente (qui est terminée proprement). */
-  attachReader(res) {
+  // --- Lectures ---------------------------------------------------------------
+
+  addReader(seq, res, gzip) {
     this.touch();
-    this.endReader();
-    res.writeHead(200, {
-      'content-type': 'application/octet-stream',
-      'cache-control': 'no-cache, no-store',
-      pragma: 'no-cache',
-      'x-accel-buffering': 'no',
-    });
-    const reader = { res, bytes: 0, idleTimer: null, maxTimer: null };
-    reader.maxTimer = setTimeout(() => this.endReader(reader), this.options.maxResponseMs);
+    if (seq < this.nextReadSeq || this.pendingReads.has(seq) || this.pendingReads.size >= this.options.maxPendingReads) {
+      return false;
+    }
+    const reader = { seq, res, gzip, chunks: [], bytes: 0, timers: [], done: false };
     res.on('close', () => {
-      if (this.reader === reader) this.endReader(reader, false);
+      if (reader.done) return;
+      reader.done = true;
+      reader.timers.forEach(clearTimeout);
+      this.pendingReads.delete(seq);
+      if (this.reader === reader) {
+        this.reader = null;
+        this.pump();
+      }
     });
-    this.reader = reader;
-    this.flush();
+    this.pendingReads.set(seq, reader);
+    this.pump();
+    return true;
   }
 
-  flush() {
+  /** Active la prochaine lecture dans l'ordre et lui transmet les données en attente. */
+  pump() {
+    if (!this.reader) {
+      const next = this.pendingReads.get(this.nextReadSeq);
+      if (!next) {
+        // Une requête intermédiaire n'est pas (encore) arrivée : on patiente, puis on la saute.
+        if (this.pendingReads.size && !this.readGapTimer) {
+          this.readGapTimer = setTimeout(() => {
+            this.readGapTimer = null;
+            if (!this.reader && this.pendingReads.size && !this.pendingReads.has(this.nextReadSeq)) {
+              this.nextReadSeq = Math.min(...this.pendingReads.keys());
+              this.pump();
+            }
+          }, this.options.sequenceGapMs);
+        }
+        return;
+      }
+      clearTimeout(this.readGapTimer);
+      this.readGapTimer = null;
+      this.pendingReads.delete(next.seq);
+      this.nextReadSeq++;
+      this.reader = next;
+      // Long polling : sans données, la réponse se termine tout de même régulièrement.
+      next.timers.push(setTimeout(() => this.finishReader(next), this.options.longPollMs));
+    }
+
     const reader = this.reader;
-    if (!reader) return;
     if (this.queue.length) {
-      const data = this.queue.join('');
+      for (const text of this.queue) reader.chunks.push(text);
+      reader.bytes += this.queueBytes;
+      const hadSync = this.queueHasSync;
       this.queue = [];
       this.queueBytes = 0;
-      reader.bytes += data.length;
-      if (!reader.res.write(data)) {
-        this.socket.pause();
-        reader.res.once('drain', () => this.socket.resume());
-      } else if (this.socket.isPaused()) {
-        this.socket.resume();
+      this.queueHasSync = false;
+      if (this.socket.isPaused()) this.socket.resume();
+
+      if (hadSync || reader.bytes >= this.options.maxResponseBytes) {
+        // Fin d'image (ou lot plein) : on envoie tout de suite.
+        reader.timers.push(setImmediate(() => this.finishReader(reader)));
+      } else {
+        if (!reader.firstDataAt) {
+          reader.firstDataAt = Date.now();
+          reader.timers.push(setTimeout(() => this.finishReader(reader), this.options.maxBatchMs));
+        }
+        clearTimeout(reader.idleTimer);
+        reader.idleTimer = setTimeout(() => this.finishReader(reader), this.options.flushDelayMs);
+        reader.timers.push(reader.idleTimer);
       }
-      clearTimeout(reader.idleTimer);
-      // Termine la réponse peu après le dernier envoi : les proxys qui
-      // attendent la fin d'une réponse avant de la transmettre restent fluides.
-      reader.idleTimer = setTimeout(() => this.endReader(reader), this.options.flushDelayMs);
-      if (reader.bytes >= this.options.maxResponseBytes) this.endReader(reader);
-    } else if (this.socket.isPaused() && reader.res.writableNeedDrain === false) {
-      this.socket.resume();
+    } else if (this.closed) {
+      this.finishReader(reader);
     }
-    if (this.closed && this.reader === reader && !this.queue.length) this.endReader(reader);
   }
 
-  endReader(reader = this.reader, writeMarker = true) {
-    if (!reader || this.reader !== reader) return;
-    this.reader = null;
-    clearTimeout(reader.idleTimer);
-    clearTimeout(reader.maxTimer);
-    if (writeMarker && !reader.res.writableEnded) reader.res.end(END_OF_RESPONSE);
+  finishReader(reader) {
+    if (reader.done) return;
+    reader.done = true;
+    reader.timers.forEach((t) => {
+      clearTimeout(t);
+      clearImmediate(t);
+    });
+    if (this.reader === reader) this.reader = null;
+
+    const body = reader.chunks.join('') + END_OF_RESPONSE;
+    const res = reader.res;
+    const send = (payload, extra = {}) => {
+      if (res.destroyed || res.writableEnded) return;
+      res.writeHead(200, { ...RESPONSE_HEADERS, ...extra, 'content-length': String(payload.length) });
+      res.end(payload);
+    };
+    if (reader.gzip && body.length > this.options.gzipMinBytes) {
+      zlib.gzip(body, { level: this.options.gzipLevel }, (err, compressed) => {
+        if (err) send(Buffer.from(body));
+        else send(compressed, { 'content-encoding': 'gzip' });
+      });
+    } else {
+      send(Buffer.from(body));
+    }
+
+    // Tunnel fermé : les lectures restantes reçoivent une réponse vide.
+    if (this.closed && !this.queue.length) {
+      const remaining = [...this.pendingReads.values()];
+      this.pendingReads.clear();
+      remaining.forEach((pending) => this.finishReader(pending));
+      return;
+    }
+    this.pump();
   }
 
-  write(data) {
+  // --- Écritures ----------------------------------------------------------------
+
+  addWrite(seq, body) {
     this.touch();
     if (this.closed) return false;
-    this.socket.write(data);
+    if (seq === null) return this.applyWrite(body);
+    if (seq < this.nextWriteSeq || this.pendingWrites.has(seq)) return true;
+    if (this.pendingWrites.size >= this.options.maxPendingWrites) return false;
+    this.pendingWrites.set(seq, body);
+    this.drainWrites();
+    return !this.closed;
+  }
+
+  drainWrites() {
+    while (this.pendingWrites.has(this.nextWriteSeq)) {
+      const body = this.pendingWrites.get(this.nextWriteSeq);
+      this.pendingWrites.delete(this.nextWriteSeq);
+      this.nextWriteSeq++;
+      if (!this.applyWrite(body)) return;
+    }
+    clearTimeout(this.writeGapTimer);
+    this.writeGapTimer = null;
+    if (this.pendingWrites.size) {
+      this.writeGapTimer = setTimeout(() => {
+        this.writeGapTimer = null;
+        if (!this.pendingWrites.size) return;
+        this.logger.warn(`Tunnel ${this.uuid} : écriture ${this.nextWriteSeq} perdue, reprise à la suivante`);
+        this.nextWriteSeq = Math.min(...this.pendingWrites.keys());
+        this.drainWrites();
+      }, this.options.sequenceGapMs);
+    }
+  }
+
+  applyWrite(body) {
+    let instructions;
+    try {
+      instructions = this.clientParser.push(body);
+    } catch (err) {
+      this.logger.warn(`Tunnel ${this.uuid} : ${err.message}`);
+      this.destroy();
+      return false;
+    }
+    let out = '';
+    for (const ins of instructions) {
+      if (ins.opcode !== '') out += toGuacd(ins); // instructions internes au tunnel ignorées
+    }
+    if (out) this.socket.write(out);
     return true;
   }
 
   destroy() {
     this.socket.destroy();
     this.markClosed();
-    this.endReader();
+    if (this.reader) this.finishReader(this.reader);
   }
 }
 
@@ -321,21 +482,28 @@ function clampInt(value, min, max, fallback) {
   return Math.min(max, Math.max(min, n));
 }
 
+const DEFAULT_OPTIONS = {
+  maxTunnels: 4,
+  inactivityMs: 30_000,
+  flushDelayMs: 8, // regroupe les instructions arrivant presque ensemble
+  maxBatchMs: 40, // délai maximal avant d'envoyer des données sans fin d'image
+  longPollMs: 10_000, // durée maximale d'une lecture sans données
+  maxResponseBytes: 512 * 1024,
+  maxQueueBytes: 768 * 1024,
+  maxPendingReads: 8,
+  maxPendingWrites: 16,
+  sequenceGapMs: 3_000,
+  maxWriteBytes: 4 * 1024 * 1024,
+  gzipMinBytes: 1024,
+  gzipLevel: 1,
+};
+
 class TunnelManager {
   constructor({ guacd, connection, logger, options = {} }) {
     this.guacd = guacd; // { host, port }
     this.connection = connection; // { protocol, params }
     this.logger = logger;
-    this.options = {
-      maxTunnels: 4,
-      inactivityMs: 30_000,
-      flushDelayMs: 40,
-      maxResponseMs: 1_000,
-      maxResponseBytes: 512 * 1024,
-      maxQueueBytes: 8 * 1024 * 1024,
-      maxWriteBytes: 4 * 1024 * 1024,
-      ...options,
-    };
+    this.options = { ...DEFAULT_OPTIONS, ...options };
     this.tunnels = new Map();
     this.sweeper = setInterval(() => this.sweep(), 5_000);
     this.sweeper.unref();
@@ -362,9 +530,10 @@ class TunnelManager {
     const query = url.search.slice(1);
     if (query === 'connect' && req.method === 'POST') return this.handleConnect(req, res, owner, ctx);
 
-    const match = /^(read|write):([0-9a-f-]{36})(?::\d+)?$/.exec(query);
+    const match = /^(read|write):([0-9a-f-]{36})(?::(\d{1,15}))?$/.exec(query);
     if (!match) return sendStatus(res, 400, STATUS.CLIENT_BAD_REQUEST, 'Requete de tunnel invalide');
-    const [, action, uuid] = match;
+    const [, action, uuid, seqText] = match;
+    const seq = seqText === undefined ? null : Number(seqText);
 
     const tunnel = this.tunnels.get(uuid);
     if (!tunnel) return sendStatus(res, 404, STATUS.RESOURCE_NOT_FOUND, 'Tunnel introuvable');
@@ -374,11 +543,14 @@ class TunnelManager {
     }
 
     if (action === 'read' && req.method === 'GET') {
-      if (tunnel.closed && !tunnel.queue.length) {
+      if (seq === null) return sendStatus(res, 400, STATUS.CLIENT_BAD_REQUEST, 'Numero de lecture manquant');
+      if (tunnel.closed && !tunnel.queue.length && !tunnel.reader) {
         this.tunnels.delete(uuid);
         return sendStatus(res, 404, STATUS.RESOURCE_NOT_FOUND, 'Tunnel ferme');
       }
-      return tunnel.attachReader(res);
+      const gzip = /\bgzip\b/.test(String(req.headers['accept-encoding'] || ''));
+      if (!tunnel.addReader(seq, res, gzip)) return sendStatus(res, 400, STATUS.CLIENT_BAD_REQUEST, 'Lecture hors sequence');
+      return undefined;
     }
 
     if (action === 'write' && req.method === 'POST') {
@@ -388,7 +560,7 @@ class TunnelManager {
       } catch {
         return sendStatus(res, 413, STATUS.CLIENT_BAD_REQUEST, 'Donnees trop volumineuses');
       }
-      if (!tunnel.write(body)) return sendStatus(res, 404, STATUS.RESOURCE_NOT_FOUND, 'Tunnel ferme');
+      if (!tunnel.addWrite(seq, body)) return sendStatus(res, 404, STATUS.RESOURCE_NOT_FOUND, 'Tunnel ferme');
       res.writeHead(200, { 'content-type': 'text/plain', 'cache-control': 'no-store', 'content-length': '0' });
       return res.end();
     }
@@ -451,6 +623,7 @@ module.exports = {
   STATUS,
   InstructionParser,
   encodeInstruction,
+  encodeInstructionUtf16,
   codepointLength,
   connectGuacd,
   GuacTunnel,

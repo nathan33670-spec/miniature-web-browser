@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Nouvelle fenêtre Chromium
+Exec=/usr/local/bin/chromium-window
+Icon=chromium
+Terminal=false

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Ouvre une nouvelle fenêtre dans le Chromium déjà lancé (même profil).
+exec chromium --user-data-dir=/data/profile --new-window "$@"

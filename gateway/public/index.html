@@ -21,7 +21,29 @@
 
 <div id="toolbar">
   <button type="button" id="menu-button" title="Menu" aria-haspopup="true" aria-expanded="false">⋯</button>
-  <div id="menu" hidden>
+  <div id="menu" hidden role="menu">
+    <div class="group">Fenêtres</div>
+    <button type="button" data-action="next-window">Fenêtre suivante</button>
+    <button type="button" data-action="close-window">Fermer la fenêtre active</button>
+    <div class="group">Bureaux</div>
+    <div class="row">
+      <button type="button" data-action="desktop-1" title="Aller au bureau 1">1</button>
+      <button type="button" data-action="desktop-2" title="Aller au bureau 2">2</button>
+      <button type="button" data-action="desktop-3" title="Aller au bureau 3">3</button>
+      <button type="button" data-action="desktop-4" title="Aller au bureau 4">4</button>
+    </div>
+    <div class="hint">Déplacer la fenêtre active vers :</div>
+    <div class="row">
+      <button type="button" data-action="send-1" title="Envoyer la fenêtre vers le bureau 1">→1</button>
+      <button type="button" data-action="send-2" title="Envoyer la fenêtre vers le bureau 2">→2</button>
+      <button type="button" data-action="send-3" title="Envoyer la fenêtre vers le bureau 3">→3</button>
+      <button type="button" data-action="send-4" title="Envoyer la fenêtre vers le bureau 4">→4</button>
+    </div>
+    <div class="group">Qualité d'affichage</div>
+    <button type="button" data-quality="haute" role="menuitemradio">Haute (net)</button>
+    <button type="button" data-quality="moyenne" role="menuitemradio">Moyenne</button>
+    <button type="button" data-quality="basse" role="menuitemradio">Basse (le plus rapide)</button>
+    <div class="group">Session</div>
     <button type="button" data-action="fullscreen">Plein écran</button>
     <button type="button" data-action="paste">Envoyer du texte…</button>
     <button type="button" data-action="reconnect">Reconnecter</button>

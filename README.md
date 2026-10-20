@@ -152,15 +152,50 @@ TLS_KEY_FILE=/data/tls/privkey.pem
 
 - **Clavier et souris** sont transmis directement ; l'écran distant s'adapte à la taille de votre
   fenêtre.
-- **Menu** (bouton `⋯` en haut à droite) : plein écran, envoi de texte dans le presse-papiers
-  distant, reconnexion, déconnexion.
+- **Barre des tâches** (en bas de l'écran distant) : les fenêtres ouvertes (pop-ups comprises),
+  réparties sur **4 bureaux**. Cliquez sur une fenêtre pour l'afficher, sur « Bureau N » pour
+  changer de bureau, glissez une fenêtre vers un autre bureau pour l'y déplacer. Le bouton à
+  gauche ouvre une nouvelle fenêtre Chromium.
+- Les **pop-ups** s'ouvrent dans leur propre fenêtre, avec barre de titre et bouton fermer.
+- **Menu** (bouton `⋯` en bas à droite) :
+  - *Fenêtres* : fenêtre suivante, fermer la fenêtre active ;
+  - *Bureaux* : aller au bureau 1-4, déplacer la fenêtre active vers un bureau ;
+  - *Qualité d'affichage* : Haute / Moyenne / Basse (résolution distante réduite puis agrandie
+    dans la page : beaucoup moins de données à transmettre sur une connexion lente) ;
+  - plein écran, envoi de texte dans le presse-papiers distant, reconnexion, déconnexion.
+- Raccourcis clavier distants (si votre système ne les intercepte pas) : `Alt+Tab` / `Super+Tab`
+  fenêtre suivante, `Super+1…4` bureau N, `Ctrl+Super+1…4` envoyer la fenêtre au bureau N,
+  `Ctrl+Alt+←/→` bureau voisin, `Alt+F4` fermer.
 - **Presse-papiers** : ce qui est copié dans Chromium arrive dans votre presse-papiers ; votre
   presse-papiers est envoyé quand la page reprend le focus (si le navigateur l'autorise), sinon
   utilisez « Envoyer du texte… ».
 - En cas de coupure réseau, la page se reconnecte automatiquement.
-- Les raccourcis réservés par votre navigateur local (Ctrl+W, Ctrl+T…) restent captés par lui :
-  utilisez le mode plein écran ou les menus de Chromium.
 - Pas de son (le flux audio n'est pas transmis).
+
+## Performances derrière un proxy d'entreprise
+
+L'affichage est conçu pour les proxys lents ou qui mettent les réponses en tampon :
+
+- **Tunnel pipeliné** : plusieurs requêtes de lecture et d'écriture sont en vol en même temps
+  (numérotées, remises dans l'ordre par la passerelle) ; une image n'attend donc plus la fin de
+  la requête précédente.
+- **Réponses courtes et compressées** (gzip) : chaque réponse se termine à la fin d'une image,
+  ce qui la rend immédiatement exploitable même si le proxy attend la fin pour la transmettre.
+- **Petits tampons** : si la connexion ne suit pas, guacd regroupe les mises à jour au lieu
+  d'accumuler du retard (plus de déconnexion « User is not responding »).
+- **HTTP/2** quand le chemin réseau le permet (davantage de requêtes simultanées) ;
+  la page s'adapte automatiquement.
+- **Chromium allégé** : défilement non animé et animations réduites (moins d'images à envoyer).
+
+Mesures sur un proxy simulé qui retient chaque réponse jusqu'à sa fin (HTTP/1.1) :
+
+| Latence aller-retour du proxy | Touche → écran (avant → après) | Images/s pendant une animation |
+|---|---|---|
+| 120 ms | 230 ms → **196 ms** | 10 → **13,5** |
+| 300 ms | 694 ms → **381 ms** | 8,4 → **9,3** |
+
+En HTTP/2, le nombre d'images par seconde augmente encore d'environ 60 %. Si l'affichage reste
+lent, passez la *Qualité d'affichage* sur Moyenne ou Basse.
 
 ## Configuration de Chromium
 

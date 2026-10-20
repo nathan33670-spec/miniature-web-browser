@@ -25,6 +25,7 @@ function loadAssets() {
   const sources = {
     '/': path.join(PUBLIC_DIR, 'index.html'),
     '/static/client.js': path.join(PUBLIC_DIR, 'client.js'),
+    '/static/tunnel.js': path.join(PUBLIC_DIR, 'tunnel.js'),
     '/static/client.css': path.join(PUBLIC_DIR, 'client.css'),
     '/static/guacamole-common.js': guacamoleLibraryPath(),
   };

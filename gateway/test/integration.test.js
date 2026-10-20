@@ -49,7 +49,10 @@ function request(port, { method = 'GET', path = '/', headers = {}, body } = {}) 
     const req = http.request({ host: '127.0.0.1', port, method, path, headers }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString() }));
+      res.on('end', () => {
+        const rawBody = Buffer.concat(chunks);
+        resolve({ status: res.statusCode, headers: res.headers, body: rawBody.toString(), rawBody });
+      });
     });
     req.on('error', reject);
     if (body) req.write(body);
@@ -210,20 +213,58 @@ test('flux complet : connexion, page client, tunnel HTTP lecture/écriture, déc
   }
 });
 
-test('une nouvelle lecture termine proprement la précédente (lectures en parallèle)', async () => {
+test('lectures en parallèle : servies dans l\'ordre, même si les requêtes arrivent dans le désordre', async () => {
   const ctx = await setup();
   try {
     const cookie = await loggedIn(ctx.port);
     const tunnel = await openTunnel(ctx.port, cookie);
     const headers = { cookie, 'guacamole-tunnel-token': tunnel.token };
-    await request(ctx.port, { path: `/tunnel?read:${tunnel.uuid}:0`, headers }); // vide la file
-    const first = request(ctx.port, { path: `/tunnel?read:${tunnel.uuid}:1`, headers });
-    await new Promise((r) => setTimeout(r, 50));
-    const second = request(ctx.port, { path: `/tunnel?read:${tunnel.uuid}:2`, headers });
-    await new Promise((r) => setTimeout(r, 50));
-    await request(ctx.port, { method: 'POST', path: `/tunnel?write:${tunnel.uuid}`, headers, body: '4.test,1.x;' });
-    assert.equal((await first).body, '0.;');
-    assert.equal((await second).body, '4.echo,1.x;0.;');
+    const read = (n) => request(ctx.port, { path: `/tunnel?read:${tunnel.uuid}:${n}`, headers });
+    const write = (n, body) => request(ctx.port, { method: 'POST', path: `/tunnel?write:${tunnel.uuid}:${n}`, headers, body });
+
+    // La lecture 1 arrive avant la 0 : la 0 reçoit quand même les premières données.
+    const r1 = read(1);
+    await new Promise((r) => setTimeout(r, 30));
+    const r0 = read(0);
+    assert.equal((await r0).body, '4.sync,1.1;0.;');
+    const r2 = read(2);
+
+    // Écritures dans le désordre : guacd les reçoit dans l'ordre 0, 1.
+    await write(1, '4.test,1.b;');
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(ctx.guacd.state.received.filter((i) => i.opcode === 'test').length, 0, 'écriture 1 retenue tant que la 0 manque');
+    await write(0, '4.test,1.a;');
+    assert.equal((await r1).body, '4.echo,1.a;4.echo,1.b;0.;', 'réponses regroupées, dans l\'ordre des écritures');
+    const tests = ctx.guacd.state.received.filter((i) => i.opcode === 'test').map((i) => i.args[0]);
+    assert.deepEqual(tests, ['a', 'b']);
+    await write(2, '4.test,1.c;');
+    assert.equal((await r2).body, '4.echo,1.c;0.;', 'la lecture suivante prend le relais');
+
+    // Numéro déjà servi : refusé.
+    assert.equal((await read(0)).status, 400);
+  } finally {
+    await ctx.close();
+  }
+});
+
+test('réponses compressées (gzip) et caractères hors BMP convertis pour le navigateur', async () => {
+  const ctx = await setup();
+  try {
+    const cookie = await loggedIn(ctx.port);
+    const tunnel = await openTunnel(ctx.port, cookie);
+    const headers = { cookie, 'guacamole-tunnel-token': tunnel.token };
+    await request(ctx.port, { path: `/tunnel?read:${tunnel.uuid}:0`, headers });
+
+    // Le navigateur compte en unités UTF-16 ("😀" = 2) ; guacd en points de code (1).
+    const big = 'x'.repeat(5000);
+    const reply = request(ctx.port, { path: `/tunnel?read:${tunnel.uuid}:1`, headers: { ...headers, 'accept-encoding': 'gzip' }, raw: true });
+    await request(ctx.port, { method: 'POST', path: `/tunnel?write:${tunnel.uuid}:0`, headers, body: `4.test,${big.length + 2}.${big}😀;` });
+    const res = await reply;
+    assert.equal(res.headers['content-encoding'], 'gzip');
+    const body = require('node:zlib').gunzipSync(res.rawBody).toString();
+    assert.equal(body, `4.echo,${big.length + 2}.${big}😀;0.;`);
+    const sent = ctx.guacd.state.received.find((i) => i.opcode === 'test');
+    assert.equal(sent.raw, `4.test,${big.length + 1}.${big}😀;`, 'guacd reçoit la longueur en points de code');
   } finally {
     await ctx.close();
   }
@@ -354,5 +395,50 @@ test('IPV4_ONLY=false : un client IPv6 est accepté', async () => {
     assert.equal(v6.status, 200);
   } finally {
     await ctx.close();
+  }
+});
+
+test('HTTPS avec HTTP/2 : connexion, page client et tunnel', async () => {
+  const os = require('node:os');
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const http2 = require('node:http2');
+  const { execFileSync } = require('node:child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rb-tls-'));
+  execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=localhost',
+    '-keyout', path.join(dir, 'key.pem'), '-out', path.join(dir, 'cert.pem')], { stdio: 'ignore' });
+  const ctx = await setup({ TLS_MODE: 'custom', TLS_CERT_FILE: path.join(dir, 'cert.pem'), TLS_KEY_FILE: path.join(dir, 'key.pem') });
+  const session = http2.connect(`https://127.0.0.1:${ctx.port}`, { rejectUnauthorized: false });
+  const h2 = (headers, body) => new Promise((resolve, reject) => {
+    const req = session.request(headers);
+    const chunks = [];
+    let head;
+    req.on('response', (h) => (head = h));
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => resolve({ status: head[':status'], headers: head, body: Buffer.concat(chunks).toString() }));
+    req.on('error', reject);
+    req.end(body);
+  });
+  try {
+    const login = await h2(
+      { ':method': 'POST', ':path': '/__auth/login', 'content-type': 'application/x-www-form-urlencoded', origin: `https://127.0.0.1:${ctx.port}` },
+      'username=nathan&password=motdepasse-solide&next=%2F'
+    );
+    assert.equal(login.status, 303, 'origine vérifiée via :authority');
+    const cookie = login.headers['set-cookie'][0].split(';')[0];
+    assert.match(login.headers['set-cookie'][0], /Secure/);
+
+    const page = await h2({ ':path': '/', cookie });
+    assert.equal(page.status, 200);
+    assert.match(page.body, /client\.js/);
+
+    const connect = await h2({ ':method': 'POST', ':path': '/tunnel?connect', cookie }, 'width=800&height=600');
+    assert.equal(connect.status, 200);
+    const read = await h2({ ':path': `/tunnel?read:${connect.body}:0`, cookie, 'guacamole-tunnel-token': connect.headers['guacamole-tunnel-token'] });
+    assert.equal(read.body, '4.sync,1.1;0.;');
+  } finally {
+    session.close();
+    await ctx.close();
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -1,0 +1,97 @@
+# Barre des tâches du bureau distant : bouton « nouvelle fenêtre », les 4 bureaux
+# avec leurs fenêtres (cliquer pour basculer, glisser une fenêtre pour la déplacer),
+# l'horloge, puis un espace réservé au bouton « ⋯ » de la page.
+
+#-------------------------------------
+# Fonds (1 : panneau, 2 : tâche, 3 : tâche active / bureau actif)
+rounded = 0
+border_width = 0
+background_color = #1c1f27 100
+border_color = #000000 0
+
+rounded = 4
+border_width = 0
+background_color = #2f3542 100
+border_color = #000000 0
+
+rounded = 4
+border_width = 1
+background_color = #2563eb 70
+border_color = #3b82f6 100
+
+#-------------------------------------
+# Panneau
+panel_items = LTC:
+panel_size = 100% 34
+panel_margin = 0 0
+panel_padding = 4 3 6
+panel_background_id = 1
+wm_menu = 0
+panel_dock = 0
+panel_position = bottom center horizontal
+panel_layer = top
+panel_monitor = all
+autohide = 0
+strut_policy = follow_size
+disable_transparency = 1
+font_shadow = 0
+
+#-------------------------------------
+# Bureaux et fenêtres
+taskbar_mode = multi_desktop
+taskbar_padding = 2 0 4
+taskbar_background_id = 0
+taskbar_active_background_id = 0
+taskbar_name = 1
+taskbar_name_padding = 8 0
+taskbar_name_background_id = 0
+taskbar_name_active_background_id = 3
+taskbar_name_font = sans Bold 9
+taskbar_name_font_color = #9ca3af 100
+taskbar_name_active_font_color = #ffffff 100
+taskbar_distribute_size = 0
+taskbar_hide_inactive_tasks = 0
+taskbar_hide_different_monitor = 0
+taskbar_always_show_all_desktop_tasks = 0
+taskbar_sort_order = none
+
+task_text = 1
+task_icon = 1
+task_centered = 0
+task_maximum_size = 220 30
+task_padding = 6 2 4
+task_font = sans 9
+task_font_color = #e5e7eb 90
+task_active_font_color = #ffffff 100
+task_iconified_font_color = #9ca3af 70
+task_background_id = 2
+task_active_background_id = 3
+task_iconified_background_id = 2
+mouse_left = toggle_iconify
+mouse_middle = close
+mouse_right = none
+mouse_scroll_up = prev_task
+mouse_scroll_down = next_task
+
+#-------------------------------------
+# Lanceur : nouvelle fenêtre Chromium
+launcher_padding = 4 2 4
+launcher_background_id = 0
+launcher_icon_size = 22
+launcher_icon_theme = hicolor
+launcher_item_app = /usr/local/share/applications/remote-chromium.desktop
+
+#-------------------------------------
+# Espace vide à droite : emplacement du bouton « ⋯ » de la page
+separator_style = empty
+separator_size = 44
+separator_padding = 0 0
+separator_background_id = 0
+
+#-------------------------------------
+# Horloge
+time1_format = %H:%M
+time1_font = sans Bold 9
+clock_font_color = #e5e7eb 100
+clock_padding = 8 0
+clock_background_id = 0

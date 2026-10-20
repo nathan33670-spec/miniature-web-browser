@@ -32,6 +32,8 @@ for _ in $(seq 1 50); do
 done
 
 openbox &
+# Barre des tâches : fenêtres ouvertes, 4 bureaux, nouvelle fenêtre.
+( sleep 1; while kill -0 "$XVNC_PID" 2>/dev/null; do tint2 -c /etc/xdg/tint2/tint2rc >/dev/null 2>&1; sleep 1; done ) &
 
 # --- Chromium ---------------------------------------------------------------------
 # Le bac à sable de Chromium nécessite les espaces de noms utilisateur ; s'ils sont
@@ -62,10 +64,11 @@ while [ "$STOPPING" = 0 ] && kill -0 "$XVNC_PID" 2>/dev/null; do
     --password-store=basic \
     --disable-gpu --disable-dev-shm-usage \
     --hide-crash-restore-bubble \
+    --disable-smooth-scrolling --force-prefers-reduced-motion \
     --lang="${LANG%%_*}" \
     --start-maximized \
     $SANDBOX_FLAG ${CHROMIUM_FLAGS:-} \
-    ${START_URL:-} &
+    ${START_URL:+"$START_URL"} &
   CHROMIUM_PID=$!
   # "wait" est interrompu par le signal : on attend ensuite la fin réelle de Chromium.
   wait "$CHROMIUM_PID" || true

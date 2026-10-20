@@ -1,5 +1,6 @@
 // Client d'affichage du navigateur distant (Guacamole, tunnel HTTP uniquement).
 import Guacamole from './guacamole-common.js';
+import { PipelinedTunnel } from './tunnel.js';
 
 const STATE = Guacamole.Client.State;
 const STATUS = Guacamole.Status.Code;
@@ -47,8 +48,30 @@ function scheduleReconnect(message) {
 // Taille de l'écran
 // ---------------------------------------------------------------------------
 
+// Qualité d'affichage : une résolution distante plus petite (agrandie ensuite
+// dans la page) réduit fortement le volume d'images à transmettre.
+const QUALITY = { haute: 1, moyenne: 0.8, basse: 0.6 };
+function loadQuality() {
+  try {
+    const q = localStorage.getItem('rb-quality');
+    if (q in QUALITY) return q;
+  } catch {}
+  return 'haute';
+}
+let quality = loadQuality();
+
 function viewportSize() {
-  return { width: Math.max(320, window.innerWidth), height: Math.max(240, window.innerHeight) };
+  const f = QUALITY[quality];
+  return {
+    width: Math.max(320, Math.round(window.innerWidth * f)),
+    height: Math.max(240, Math.round(window.innerHeight * f)),
+  };
+}
+
+function updateQualityMenu() {
+  for (const el of menu.querySelectorAll('[data-quality]')) {
+    el.setAttribute('aria-checked', String(el.dataset.quality === quality));
+  }
 }
 
 function rescale() {
@@ -57,8 +80,7 @@ function rescale() {
   const width = display.getWidth();
   const height = display.getHeight();
   if (!width || !height) return;
-  const { width: vw, height: vh } = viewportSize();
-  display.scale(Math.min(vw / width, vh / height, 1));
+  display.scale(Math.min(window.innerWidth / width, window.innerHeight / height));
 }
 
 let resizeTimer = null;
@@ -101,6 +123,19 @@ window.addEventListener('focus', syncLocalClipboard);
 // Connexion
 // ---------------------------------------------------------------------------
 
+// Nombre de requêtes simultanées : en HTTP/1.1 le navigateur limite à 6
+// connexions par site ; en HTTP/2 (ou HTTP/3) on peut en garder davantage.
+function tunnelConcurrency() {
+  const params = new URLSearchParams(window.location.search);
+  const nav = performance.getEntriesByType('navigation')[0];
+  const multiplexed = /^h[23]/.test((nav && nav.nextHopProtocol) || '');
+  const pick = (name, fallback, max) => Math.min(max, Math.max(1, Number(params.get(name)) || fallback));
+  return {
+    reads: pick('reads', multiplexed ? 6 : 3, 8),
+    writes: pick('writes', multiplexed ? 3 : 2, 4),
+  };
+}
+
 function connect() {
   clearTimeout(retryTimer);
   if (client) {
@@ -111,9 +146,10 @@ function connect() {
   container.replaceChildren();
   showStatus('Connexion au navigateur…');
 
-  const tunnel = new Guacamole.HTTPTunnel('/tunnel');
+  const tunnel = new PipelinedTunnel('/tunnel', tunnelConcurrency());
   const guac = new Guacamole.Client(tunnel);
   client = guac;
+  window.__remoteBrowser = { client: guac, tunnel }; // utile au diagnostic depuis la console
 
   const display = guac.getDisplay();
   const element = display.getElement();
@@ -204,6 +240,33 @@ keyboard.onkeyup = (keysym) => {
 window.addEventListener('blur', () => keyboard.reset());
 
 // ---------------------------------------------------------------------------
+// Fenêtres et bureaux : combinaisons envoyées au gestionnaire de fenêtres distant
+// (Alt+Tab etc. sont interceptés par votre système, d'où ces commandes).
+// ---------------------------------------------------------------------------
+
+// XF86Launch5/6 : touches réservées au gestionnaire de fenêtres distant (openbox-rc.xml).
+const KEY = { super: 0xffeb, ctrl: 0xffe3, nextWindow: 0x1008ff45, closeWindow: 0x1008ff46 };
+
+function sendCombo(...keysyms) {
+  if (!client) return;
+  for (const k of keysyms) client.sendKeyEvent(1, k);
+  for (const k of [...keysyms].reverse()) client.sendKeyEvent(0, k);
+}
+
+const WINDOW_ACTIONS = {
+  'next-window': () => sendCombo(KEY.nextWindow),
+  'close-window': () => sendCombo(KEY.closeWindow),
+  'desktop-1': () => sendCombo(KEY.super, 0x31),
+  'desktop-2': () => sendCombo(KEY.super, 0x32),
+  'desktop-3': () => sendCombo(KEY.super, 0x33),
+  'desktop-4': () => sendCombo(KEY.super, 0x34),
+  'send-1': () => sendCombo(KEY.ctrl, KEY.super, 0x31),
+  'send-2': () => sendCombo(KEY.ctrl, KEY.super, 0x32),
+  'send-3': () => sendCombo(KEY.ctrl, KEY.super, 0x33),
+  'send-4': () => sendCombo(KEY.ctrl, KEY.super, 0x34),
+};
+
+// ---------------------------------------------------------------------------
 // Menu
 // ---------------------------------------------------------------------------
 
@@ -222,10 +285,24 @@ document.addEventListener('mousedown', (e) => {
 });
 
 menu.addEventListener('click', (e) => {
+  const qualityItem = e.target.closest('[data-quality]');
+  if (qualityItem) {
+    quality = qualityItem.dataset.quality;
+    try {
+      localStorage.setItem('rb-quality', quality);
+    } catch {}
+    updateQualityMenu();
+    setMenuOpen(false);
+    if (client) client.sendSize(viewportSize().width, viewportSize().height);
+    return;
+  }
   const action = e.target.closest('[data-action]')?.dataset.action;
   if (!action) return;
   setMenuOpen(false);
-  if (action === 'fullscreen') {
+  if (WINDOW_ACTIONS[action]) {
+    WINDOW_ACTIONS[action]();
+    container.focus();
+  } else if (action === 'fullscreen') {
     if (document.fullscreenElement) document.exitFullscreen();
     else document.documentElement.requestFullscreen?.().catch(() => {});
   } else if (action === 'paste') {
@@ -253,4 +330,5 @@ reconnectButton.addEventListener('click', () => {
 
 window.addEventListener('beforeunload', () => client && client.disconnect());
 
+updateQualityMenu();
 connect();

@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 const net = require('node:net');
 const http = require('node:http');
-const https = require('node:https');
+const http2 = require('node:http2');
 
 const { AccessControl, IpSet, resolveClientIp, detectDockerGateways, normalizeIp } = require('./ipfilter');
 const { verifyPassword, hashPassword, safeEqual, TotpVerifier, SessionStore, LoginLimiter } = require('./auth');
@@ -134,7 +134,7 @@ async function createGateway(config, { logger = createLogger(config.logLevel), d
     const clientIp = resolveClientIp(remote, req.headers['x-forwarded-for'], trustedProxies);
     const viaProxy = trustedProxies.size > 0 && trustedProxies.has(remote);
     const secure = tlsEnabled || (viaProxy && String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https');
-    const host = (viaProxy && req.headers['x-forwarded-host']) || req.headers.host || '';
+    const host = (viaProxy && req.headers['x-forwarded-host']) || req.headers.host || req.headers[':authority'] || '';
     return { clientIp, secure, host };
   }
 
@@ -298,7 +298,12 @@ async function createGateway(config, { logger = createLogger(config.logLevel), d
     });
 
   const server = tlsEnabled
-    ? https.createServer({ cert: fs.readFileSync(config.tls.certFile), key: fs.readFileSync(config.tls.keyFile) }, handler)
+    ? // HTTP/2 quand le navigateur (ou le proxy) le permet : plus de limite de
+      // 6 connexions, le tunnel peut garder davantage de requêtes en vol.
+      http2.createSecureServer(
+        { cert: fs.readFileSync(config.tls.certFile), key: fs.readFileSync(config.tls.keyFile), allowHTTP1: true },
+        handler
+      )
     : http.createServer(handler);
   server.on('upgrade', onUpgrade);
   // Coupe immédiatement les connexions IPv6 directes, avant même la négociation TLS.
@@ -306,6 +311,11 @@ async function createGateway(config, { logger = createLogger(config.logLevel), d
     if (config.access.ipv4Only && !net.isIPv4(normalizeIp(socket.remoteAddress))) socket.destroy();
   });
   server.on('clientError', (err, socket) => socket.destroy());
+  const h2Sessions = new Set();
+  server.on('session', (session) => {
+    h2Sessions.add(session);
+    session.once('close', () => h2Sessions.delete(session));
+  });
   // Pas de limite globale sur la durée d'une requête (téléchargements longs) ;
   // les en-têtes doivent cependant arriver rapidement.
   server.requestTimeout = 0;
@@ -339,6 +349,7 @@ async function createGateway(config, { logger = createLogger(config.logLevel), d
       if (publicIp) publicIp.stop();
       for (const key of [...sessions.sessions.keys()]) sessions.destroyByKey(key);
       server.closeAllConnections?.();
+      for (const session of h2Sessions) session.destroy();
       await new Promise((resolve) => server.close(resolve));
     },
   };
